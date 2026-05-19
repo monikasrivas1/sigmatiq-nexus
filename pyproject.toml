@@ -20,6 +20,7 @@ dev = [
 [project.scripts]
 nexus = "sigmatiq_nexus.nexus_worker:main"
 nexus-audit-features = "sigmatiq_nexus.feature_audit:main"
+nexus-audit-inputs = "sigmatiq_nexus.input_readiness_audit:main"
 
 [build-system]
 requires = ["hatchling"]
