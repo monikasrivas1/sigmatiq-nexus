@@ -3104,7 +3104,7 @@ class SigmatiqNexus:
             return
         if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
-        sentiment, valid = await self.calculate_low_sweep_heuristic(df, slot)
+        sentiment, valid = await self.calculate_low_sweep_heuristic(df, symbol, slot)
         if valid:
             lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
             await self._publish_intermediate(strategy, symbol, sentiment, 1.0, slot, session_date, lead_raw_symbol)
@@ -3112,7 +3112,7 @@ class SigmatiqNexus:
         else:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="low_sweep_heuristic_not_met", **self._window_log_fields(df, slot))
 
-    async def calculate_low_sweep_heuristic(self, df, slot: dict):
+    async def calculate_low_sweep_heuristic(self, df, symbol: str, slot: dict):
         stats = window_stats(df)
         side = dominant_side(stats)
         if stats["total_p"] < min_window_premium(symbol) or side is None or stats["sweep"] > 0.10:
