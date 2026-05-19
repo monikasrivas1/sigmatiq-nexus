@@ -40,6 +40,19 @@ GROUP_LOCK_STRATEGIES = {
     if s.strip()
 }
 MIN_WINDOW_PREMIUM = float(os.environ.get("NEXUS_MIN_WINDOW_PREMIUM", "200000"))
+_MIN_WINDOW_PREMIUM_OVERRIDES: dict[str, float] = {}
+for _ovr in os.environ.get("NEXUS_MIN_WINDOW_PREMIUM_OVERRIDES", "").split(","):
+    _ovr = _ovr.strip()
+    if "=" in _ovr:
+        _sym, _val = _ovr.split("=", 1)
+        try:
+            _MIN_WINDOW_PREMIUM_OVERRIDES[_sym.strip().upper()] = float(_val.strip())
+        except ValueError:
+            pass
+
+
+def min_window_premium(symbol: str) -> float:
+    return _MIN_WINDOW_PREMIUM_OVERRIDES.get(symbol.upper(), MIN_WINDOW_PREMIUM)
 SIDE_DOMINANCE = float(os.environ.get("NEXUS_SIDE_DOMINANCE", "2.0"))
 OPEN_CALL_DOMINANCE = float(os.environ.get("NEXUS_OPEN_CALL_DOMINANCE", "1.5"))
 LIVE_PERSISTENCE_EVENT_STREAM = os.environ.get("LIVE_PERSISTENCE_EVENT_STREAM", "live:persistence:events")
@@ -59,7 +72,7 @@ NEXUS_REQUIRE_CONTEXT_TIMESTAMPS = os.environ.get("NEXUS_REQUIRE_CONTEXT_TIMESTA
 VOL_CONTEXT_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_VOL_CONTEXT_MAX_AGE_SECONDS", "120"))
 GEX_CONTEXT_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GEX_CONTEXT_MAX_AGE_SECONDS", "120"))
 UNDERLYING_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_UNDERLYING_MAX_AGE_SECONDS", "120"))
-OPTION_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_OPTION_QUOTE_MAX_AGE_SECONDS", "5"))
+OPTION_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_OPTION_QUOTE_MAX_AGE_SECONDS", "15"))
 GREEK_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GREEK_MAX_AGE_SECONDS", "60"))
 PRICING_LAG_MIN_BASELINE_SECONDS = int(os.environ.get("NEXUS_PRICING_LAG_MIN_BASELINE_SECONDS", "300"))
 PRICING_LAG_MIN_PRICE_MOVE = float(os.environ.get("NEXUS_PRICING_LAG_MIN_PRICE_MOVE", "0.005"))
@@ -1325,7 +1338,7 @@ class SigmatiqNexus:
             "put_premium": stats["put_p"],
             "sweep_ratio": stats["sweep"],
             "dominant_side": dominant_side(stats),
-            "min_window_premium_required": MIN_WINDOW_PREMIUM,
+            "min_window_premium_required": min_window_premium(symbol),
             "side_dominance_threshold": SIDE_DOMINANCE,
             "open_call_dominance_threshold": OPEN_CALL_DOMINANCE,
         }
@@ -2929,7 +2942,7 @@ class SigmatiqNexus:
         if slot["entry_label"] != "10:00" or symbol not in {"SPY", "QQQ"}:
             return None, False
         stats = window_stats(df)
-        if stats["total_p"] < MIN_WINDOW_PREMIUM:
+        if stats["total_p"] < min_window_premium(symbol):
             return None, False
         iv_rank, _, _ = await self.get_context(symbol)
         if iv_rank >= SPREAD_MAX_IV_RANK:
@@ -2963,7 +2976,7 @@ class SigmatiqNexus:
         if slot["entry_label"] != "10:00" or symbol != "SPY":
             return None, False
         stats = window_stats(df)
-        if stats["total_p"] < MIN_WINDOW_PREMIUM:
+        if stats["total_p"] < min_window_premium(symbol):
             return None, False
         iv_rank, _, _ = await self.get_context(symbol)
         if iv_rank >= SPREAD_MAX_IV_RANK:
@@ -3053,7 +3066,7 @@ class SigmatiqNexus:
         if iv_rank >= 30:
             return None, False
         stats = window_stats(df)
-        if stats["call_p"] < MIN_WINDOW_PREMIUM:
+        if stats["call_p"] < min_window_premium(symbol):
             return None, False
         if stats["put_p"] > 0 and stats["call_p"] < stats["put_p"] * OPEN_CALL_DOMINANCE:
             return None, False
@@ -3074,10 +3087,10 @@ class SigmatiqNexus:
             "put_premium_share": put_share,
             "premium_put_call_ratio": ratio,
             "dominant_side": dominant_side(stats),
-            "min_window_premium_required": MIN_WINDOW_PREMIUM,
+            "min_window_premium_required": min_window_premium(symbol),
             "open_call_dominance_threshold": OPEN_CALL_DOMINANCE,
         }
-        if iv_rank >= 30 or stats["total_p"] < MIN_WINDOW_PREMIUM:
+        if iv_rank >= 30 or stats["total_p"] < min_window_premium(symbol):
             return "CHOP", "cheap_vol_or_premium_filter_not_met", evidence
         if stats["call_p"] > stats["put_p"] * OPEN_CALL_DOMINANCE:
             return "BULLISH", "call_dominance", evidence
@@ -3102,7 +3115,7 @@ class SigmatiqNexus:
     async def calculate_low_sweep_heuristic(self, df, slot: dict):
         stats = window_stats(df)
         side = dominant_side(stats)
-        if stats["total_p"] < MIN_WINDOW_PREMIUM or side is None or stats["sweep"] > 0.10:
+        if stats["total_p"] < min_window_premium(symbol) or side is None or stats["sweep"] > 0.10:
             return None, False
         if slot["entry_label"] == "10:00" and side == "C":
             return "BULLISH", True
@@ -3115,7 +3128,7 @@ class SigmatiqNexus:
     async def assess_low_sweep_window(self, df, symbol, slot: dict):
         stats = window_stats(df)
         side = dominant_side(stats)
-        if stats["total_p"] < MIN_WINDOW_PREMIUM:
+        if stats["total_p"] < min_window_premium(symbol):
             return "CHOP", "premium_below_threshold"
         if stats["sweep"] > 0.10:
             return "CHOP", "sweep_ratio_too_high"
@@ -3152,7 +3165,7 @@ class SigmatiqNexus:
         iv_rank, atm_iv, net_gex = await self.get_context(symbol)
         stats = window_stats(df)
         side = dominant_side(stats)
-        if stats["total_p"] < MIN_WINDOW_PREMIUM or side is None:
+        if stats["total_p"] < min_window_premium(symbol) or side is None:
             return None, False
         entry = slot["entry_label"]
         if entry in {"10:00", "10:30", "11:00"}:

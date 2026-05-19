@@ -283,9 +283,19 @@ def audit_context_features(context: dict[str, Any] | None = None) -> dict[str, F
     return checks
 
 
-def audit_strategies(feature_checks: dict[str, FeatureCheck]) -> dict[str, dict[str, Any]]:
+def audit_strategies(
+    feature_checks: dict[str, FeatureCheck],
+    symbol: str | None = None,
+    entry_label: str | None = None,
+) -> dict[str, dict[str, Any]]:
     output: dict[str, dict[str, Any]] = {}
     for strategy, required in STRATEGY_REQUIREMENTS.items():
+        # Check window applicability when symbol/entry_label are provided
+        if symbol and entry_label:
+            slot = {"entry_label": entry_label}
+            if not nw.strategy_window_view_applicable(strategy, symbol, slot):
+                output[strategy] = {"status": "not_applicable", "missing": [], "warnings": []}
+                continue
         missing = [name for name in required if not feature_checks.get(name, FeatureCheck(name, "missing")).ok]
         warnings = [
             f"{name}: {feature_checks[name].reason}"
@@ -297,17 +307,22 @@ def audit_strategies(feature_checks: dict[str, FeatureCheck]) -> dict[str, dict[
     return output
 
 
-def audit_payload(raw_payload: dict[str, Any], context: dict[str, Any] | None = None) -> dict[str, Any]:
+def audit_payload(
+    raw_payload: dict[str, Any],
+    context: dict[str, Any] | None = None,
+    entry_label: str | None = None,
+) -> dict[str, Any]:
     context = dict(context or {})
     context["_reference_time"] = nw.parse_event_datetime(raw_payload)
     event_checks = audit_event_features(raw_payload)
     context_checks = audit_context_features(context)
     checks = {**event_checks, **context_checks}
+    symbol = str(raw_payload.get("symbol") or raw_payload.get("underlying") or "").upper()
     return {
-        "symbol": str(raw_payload.get("symbol") or raw_payload.get("underlying") or "").upper(),
+        "symbol": symbol,
         "raw_symbol": raw_payload.get("raw_symbol") or raw_payload.get("rawSymbol"),
         "features": {name: check.__dict__ for name, check in sorted(checks.items())},
-        "strategies": audit_strategies(checks),
+        "strategies": audit_strategies(checks, symbol=symbol, entry_label=entry_label),
     }
 
 
