@@ -1203,6 +1203,10 @@ def test_publish_window_assessments_writes_no_bet_strategy_audit():
     assert worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "QQQ", "strategy_audit")]
     assert any(fields["redis_key"] == "nexus_strategy_audit:QQQ:etf_open_specialist:10:00" for _, fields, _, _ in worker.redis.xadds)
     assert ("signal:strategy_audit", json.dumps(audit)) in worker.redis.publishes
+    view = json.loads(worker.redis.values["nexus_window_view:QQQ:etf_open_specialist:10:00"])
+    assert view["decision"] == "WINDOW_VIEW"
+    assert view["sentiment"] == "CHOP"
+    assert view["reason"] == "no_open_dominance"
 
 
 def test_publish_window_assessments_audits_not_applicable_strategy_lanes():
@@ -2618,7 +2622,7 @@ def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():
     assert "BET" not in decisions
 
 
-def test_publish_window_assessments_skips_spread_window_views_for_unsupported_symbol_and_window():
+def test_publish_window_assessments_publishes_skipped_spread_window_views_for_unsupported_symbol():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.redis = FakeRedis({
         "options:live:vrp:IWM": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:05:00Z"}),
@@ -2651,12 +2655,15 @@ def test_publish_window_assessments_skips_spread_window_views_for_unsupported_sy
 
     asyncio.run(worker.publish_window_assessments(df, "IWM", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
 
-    keys = [key for key, _ in worker.redis.sets]
-    assert "nexus_window_view:IWM:etf_put_credit_open30_spread:10:00" not in keys
-    assert "nexus_window_view:IWM:etf_call_credit_open30_spread:10:00" not in keys
+    put_view = json.loads(worker.redis.values["nexus_window_view:IWM:etf_put_credit_open30_spread:10:00"])
+    call_view = json.loads(worker.redis.values["nexus_window_view:IWM:etf_call_credit_open30_spread:10:00"])
+    assert put_view["decision"] == "SKIPPED"
+    assert put_view["reason"] == "strategy_not_applicable_to_symbol_or_window"
+    assert call_view["decision"] == "SKIPPED"
+    assert call_view["reason"] == "strategy_not_applicable_to_symbol_or_window"
 
 
-def test_publish_window_assessments_skips_spread_window_views_outside_open30_slot():
+def test_publish_window_assessments_publishes_skipped_spread_window_views_outside_open30_slot():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.redis = FakeRedis({
         "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:35:00Z"}),
@@ -2689,9 +2696,12 @@ def test_publish_window_assessments_skips_spread_window_views_outside_open30_slo
 
     asyncio.run(worker.publish_window_assessments(df, "SPY", nw.DECISION_SLOTS[1], datetime(2026, 5, 5).date()))
 
-    keys = [key for key, _ in worker.redis.sets]
-    assert "nexus_window_view:SPY:etf_put_credit_open30_spread:10:30" not in keys
-    assert "nexus_window_view:SPY:etf_call_credit_open30_spread:10:30" not in keys
+    put_view = json.loads(worker.redis.values["nexus_window_view:SPY:etf_put_credit_open30_spread:10:30"])
+    call_view = json.loads(worker.redis.values["nexus_window_view:SPY:etf_call_credit_open30_spread:10:30"])
+    assert put_view["decision"] == "SKIPPED"
+    assert put_view["reason"] == "strategy_not_applicable_to_symbol_or_window"
+    assert call_view["decision"] == "SKIPPED"
+    assert call_view["reason"] == "strategy_not_applicable_to_symbol_or_window"
 
 
 def test_default_first_trigger_scope_prevents_second_strategy_final_publish():

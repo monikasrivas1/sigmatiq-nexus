@@ -2617,11 +2617,12 @@ class SigmatiqNexus:
         self,
         strategy: str,
         symbol: str,
-        sentiment: str,
+        sentiment: str | None,
         reason: str,
         slot: dict,
         session_date,
         evidence: dict | None = None,
+        decision: str = "WINDOW_VIEW",
     ) -> None:
         key = (str(session_date), symbol, strategy, slot["entry_label"])
         reported = getattr(self, "window_views_reported", set())
@@ -2633,8 +2634,7 @@ class SigmatiqNexus:
             "strategy": strategy,
             "symbol": symbol,
             "stage": 0,
-            "decision": "WINDOW_VIEW",
-            "sentiment": sentiment,
+            "decision": decision,
             "reason": reason,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "session_date": str(session_date),
@@ -2643,6 +2643,8 @@ class SigmatiqNexus:
             "window_end": slot["window_end"].isoformat(),
             "source": "sigmatiq_nexus",
         }
+        if sentiment is not None:
+            msg["sentiment"] = sentiment
         lead_contract = self._window_lead_contract(getattr(self, "_current_window_df", pl.DataFrame()))
         pricing_summary = getattr(self, "_current_window_pricing_summary", {}) or {}
         profiles = pricing_summary.get("profiles") or []
@@ -2664,7 +2666,7 @@ class SigmatiqNexus:
         )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
-        self._log("strategy_window_view_published", strategy=strategy, symbol=symbol, sentiment=sentiment, reason=reason, session_date=str(session_date), entry_time=slot["entry_label"])
+        self._log("strategy_window_view_published", strategy=strategy, symbol=symbol, decision=decision, sentiment=sentiment, reason=reason, session_date=str(session_date), entry_time=slot["entry_label"])
 
     async def publish_window_pricing(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:
         key = (str(session_date), symbol, slot["entry_label"])
@@ -2810,6 +2812,7 @@ class SigmatiqNexus:
         ]
         for strategy, assessor in strategies:
             if not strategy_window_view_applicable(strategy, symbol, slot):
+                inputs = self._window_audit_inputs(df)
                 await self._publish_strategy_audit(
                     strategy,
                     symbol,
@@ -2817,7 +2820,17 @@ class SigmatiqNexus:
                     session_date,
                     "SKIPPED",
                     "strategy_not_applicable_to_symbol_or_window",
-                    inputs=self._window_audit_inputs(df),
+                    inputs=inputs,
+                )
+                await self._publish_window_view(
+                    strategy,
+                    symbol,
+                    None,
+                    "strategy_not_applicable_to_symbol_or_window",
+                    slot,
+                    session_date,
+                    evidence={"inputs": inputs},
+                    decision="SKIPPED",
                 )
                 continue
             failures = await self._strategy_feature_failures(strategy, symbol, df, reference_time)

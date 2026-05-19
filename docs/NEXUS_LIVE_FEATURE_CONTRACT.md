@@ -429,6 +429,8 @@ Cheap/costly contract and side reads are only emitted when Nexus has point-in-ti
   - Redis key: `nexus_window_view:{symbol}:{strategy}:{entry_label}`
   - Pub/Sub: `signal:window_view:{strategy}`
   - `BLOCKED` diagnostics use the same key and Pub/Sub family with `decision="BLOCKED"` when a strategy cannot safely form a view because live inputs are missing, stale, or untradable
+  - `SKIPPED` diagnostics use the same key and Pub/Sub family with `decision="SKIPPED"` when a strategy lane is not applicable to the symbol or completed window
+  - The key family is the complete per-strategy/window ledger. Post-session review should expect one latest row per evaluated `symbol + strategy + entry_label`, not only directional `WINDOW_VIEW` rows.
 - `WINDOW_PRICING`
   - Redis key: `nexus_window_pricing:{symbol}:{entry_label}`
   - Pub/Sub: `signal:window_pricing`
