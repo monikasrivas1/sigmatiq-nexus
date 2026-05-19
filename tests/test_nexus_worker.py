@@ -886,7 +886,7 @@ def test_publish_final_appends_live_persistence_event():
     assert payload["risk"]["guard_activate_pct"] == nw.GUARD_ACTIVATE_PCT
     assert payload["risk"]["guard_floor_pct"] == nw.GUARD_FLOOR_PCT
     assert payload["quote_freshness"] == "available"
-    assert payload["quote_valid_until"] == "2026-05-05T14:00:05+00:00"
+    assert payload["quote_valid_until"] == "2026-05-05T14:00:15+00:00"
     assert payload["entry_quote"]["option_mid"] == 1.24
     assert payload["entry_quote"]["option_bid"] == 1.2
     assert payload["entry_quote"]["option_ask"] == 1.28
@@ -1649,7 +1649,7 @@ def test_spread_final_blocks_when_leg_quote_is_stale():
         "option_bid": 0.55,
         "option_ask": 0.60,
         "quote_ts": "2026-05-05T13:55:00Z",
-        "quote_age_ms": 10_000,
+        "quote_age_ms": 20_000,
         "tradability_bucket": "tradable",
     }
     candidate = {
@@ -1847,7 +1847,7 @@ def test_runtime_gate_blocks_stale_option_mid_for_confluence():
         "underlying_mid": 700.25,
         "underlying_ts_utc": "2026-05-05T14:00:00Z",
         "option_mid": 1.24,
-        "quote_age_ms": 10_000,
+        "quote_age_ms": 20_000,
     }
     df = pl.DataFrame([nw.normalize_trade_payload(payload)])
 
@@ -2307,7 +2307,7 @@ def test_active_position_mid_uses_tracked_contract_not_unrelated_symbol_trade():
     assert liquidate["raw_symbol"] == "SPY   260505C00700000"
     assert liquidate["exit_price"] == 4.9
     assert liquidate["quote_freshness"] == "stale"
-    assert liquidate["quote_valid_until"] == "2026-05-05T14:06:05+00:00"
+    assert liquidate["quote_valid_until"] == "2026-05-05T14:06:15+00:00"
     assert liquidate["execution"]["order_type"] == "limit"
     assert liquidate["execution"]["reference_price"] == 4.9
     assert liquidate["execution"]["quote_freshness"] == "stale"

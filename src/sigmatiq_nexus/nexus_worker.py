@@ -1329,7 +1329,7 @@ class SigmatiqNexus:
             })
         return fields
 
-    def _window_audit_inputs(self, df: pl.DataFrame, evidence: dict | None = None) -> dict:
+    def _window_audit_inputs(self, df: pl.DataFrame, symbol: str | None = None, evidence: dict | None = None) -> dict:
         stats = window_stats(df)
         inputs = {
             "rows": int(df.height),
@@ -1338,7 +1338,7 @@ class SigmatiqNexus:
             "put_premium": stats["put_p"],
             "sweep_ratio": stats["sweep"],
             "dominant_side": dominant_side(stats),
-            "min_window_premium_required": min_window_premium(symbol),
+            "min_window_premium_required": min_window_premium(symbol) if symbol else MIN_WINDOW_PREMIUM,
             "side_dominance_threshold": SIDE_DOMINANCE,
             "open_call_dominance_threshold": OPEN_CALL_DOMINANCE,
         }
@@ -2825,7 +2825,7 @@ class SigmatiqNexus:
         ]
         for strategy, assessor in strategies:
             if not strategy_window_view_applicable(strategy, symbol, slot):
-                inputs = self._window_audit_inputs(df)
+                inputs = self._window_audit_inputs(df, symbol)
                 await self._publish_strategy_audit(
                     strategy,
                     symbol,
@@ -2855,7 +2855,7 @@ class SigmatiqNexus:
                     session_date,
                     "BLOCKED",
                     "live_feature_quality_gate_closed",
-                    inputs=self._window_audit_inputs(df),
+                    inputs=self._window_audit_inputs(df, symbol),
                     feature_failures=failures,
                 )
                 await self._publish_feature_block(strategy, symbol, slot, session_date, failures)
@@ -2875,7 +2875,7 @@ class SigmatiqNexus:
                 audit_decision,
                 reason,
                 sentiment=sentiment,
-                inputs=self._window_audit_inputs(df, evidence),
+                inputs=self._window_audit_inputs(df, symbol, evidence),
             )
             await self._publish_window_view(strategy, symbol, sentiment, reason, slot, session_date, evidence=evidence)
         self._current_window_df = pl.DataFrame()
@@ -3112,7 +3112,10 @@ class SigmatiqNexus:
         else:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="low_sweep_heuristic_not_met", **self._window_log_fields(df, slot))
 
-    async def calculate_low_sweep_heuristic(self, df, symbol: str, slot: dict):
+    async def calculate_low_sweep_heuristic(self, df, symbol: str | dict, slot: dict | None = None):
+        if slot is None:
+            slot = symbol
+            symbol = ""
         stats = window_stats(df)
         side = dominant_side(stats)
         if stats["total_p"] < min_window_premium(symbol) or side is None or stats["sweep"] > 0.10:
