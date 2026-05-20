@@ -134,6 +134,19 @@ The audit is read-only. It compares `live.prepared_*` materializer rows and raw-
 
 With the live DB materializer replay migration deployed, the audit also reads materialized EOD context values, lead-contract quote-as-of-window fields, replay gate status, and explicit missing-input JSON from `live.prepared_nexus_window_context`. Fields that persisted raw OPRA trades cannot prove, such as sweep and true aggressor classification, stay as warnings instead of simulated green checks.
 
+## DB Replay Signal Emitter
+
+The DB replay emitter is an additive recovery/audit path for days where Redis live evaluation missed a candidate but persisted raw and materialized DB rows can prove the minimum decision inputs. It writes `INTERMEDIATE` rows to `live.nexus_strategy_signal` with `source="sigmatiq_nexus_db_replay"` and records idempotence in `live.nexus_db_signal_emission`.
+
+```bash
+nexus-db-signal-emitter \
+  --session-date 2026-05-20 \
+  --symbols SPY,QQQ,IWM,UVXY \
+  --dry-run
+```
+
+For v1 this runner only emits `etf_open_specialist` open30 bullish call-dominance candidates when `live.prepared_nexus_window_context` proves ready materialized context, healthy EOD context, fresh quote-as-of-window data, required premium, and a lead contract. It does not publish Redis overlays, execution events, or final `BET` rows; live `BET` remains owned by the Redis Nexus worker.
+
 At runtime Nexus enriches raw option trade events from:
 
 - `equity:live:context:{symbol}` for `underlying_mid` and spot freshness.

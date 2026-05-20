@@ -27,6 +27,8 @@ Databento / market data
 
 MCP and chat clients should call `sigmatiq-api` endpoints. They should not read Nexus Redis keys directly unless they are operational/debug tooling.
 
+The parallel DB replay path starts from persisted raw/live tables, materializes `live.prepared_nexus_window_context`, and can append DB-proven `INTERMEDIATE` audit candidates to `live.nexus_strategy_signal` with `source="sigmatiq_nexus_db_replay"`. It is intentionally not a Redis live-overlay publisher and does not create final `BET` rows.
+
 ## Upstream Inputs Nexus Uses
 
 | Input | Example key or stream | Current use |
@@ -47,6 +49,7 @@ MCP and chat clients should call `sigmatiq-api` endpoints. They should not read 
 | `STRATEGY_AUDIT` | `nexus_strategy_audit:{symbol}:{strategy}:{entry_label}` | `signal:strategy_audit`, `signal:strategy_audit:{strategy}` | Completed strategy windows | Per-lane decision audit for every strategy check, including skipped/not-applicable lanes, feature blocks, `NO_BET` gates, and directional window reads. | No |
 | `INTERMEDIATE` | `nexus_intermediate:{symbol}:{strategy}:{entry_label}` | `nexus_intermediate:updates`, `signal:intermediate:{strategy}` | Strategy windows | Stage-1 paper candidate before final quote gate or final decision. | No |
 | `BET` | `nexus_live_overlay:{symbol}` | `nexus_live_overlay:updates` | Strategy windows, only when a strategy passes | Final paper signal with exact `raw_symbol`, quote snapshot, reference price, freshness, and execution metadata. | Paper signal only |
+| DB replay `INTERMEDIATE` | Postgres only: `live.nexus_strategy_signal` with `source="sigmatiq_nexus_db_replay"` | None | Post-session or controlled replay | Audit/recovery candidate when persisted DB inputs prove the v1 open-specialist gate. | No |
 | `WINDOW_VIEW` | `nexus_window_view:{symbol}:{strategy}:{entry_label}` | `signal:window_view:{strategy}` | Completed strategy windows | Strategy-specific directional read for the completed window, even if no trade candidate is emitted. | No |
 | `BLOCKED` | Same key family as `WINDOW_VIEW` | Same channel family as `WINDOW_VIEW` | Completed strategy windows | Fail-closed diagnostic when a strategy cannot safely form a view or trade candidate because required live fields are missing, stale, or untradable. | No |
 | `SKIPPED` | Same key family as `WINDOW_VIEW` | Same channel family as `WINDOW_VIEW` | Completed strategy windows | Explicit diagnostic when a strategy lane is not applicable to the symbol or completed window. | No |
