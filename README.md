@@ -142,10 +142,16 @@ The DB replay emitter is an additive recovery/audit path for days where Redis li
 nexus-db-signal-emitter \
   --session-date 2026-05-20 \
   --symbols SPY,QQQ,IWM,UVXY \
+  --strategies etf_open_specialist,etf_low_sweep_core \
   --dry-run
 ```
 
-For v1 this runner only emits `etf_open_specialist` open30 bullish call-dominance candidates when `live.prepared_nexus_window_context` proves ready materialized context, healthy EOD context, fresh quote-as-of-window data, required premium, and a lead contract. It does not publish Redis overlays, execution events, or final `BET` rows; live `BET` remains owned by the Redis Nexus worker.
+For v1 this runner emits only DB-proven `INTERMEDIATE` candidates:
+
+- `etf_open_specialist`: 10:00 ET open30 bullish call dominance with ready materialized context, healthy EOD context, fresh quote-as-of-window data, required premium, and a call-side lead contract.
+- `etf_low_sweep_core`: 10:00/10:30 ET low-sweep side dominance only when DB materialization proves `sweep_quality_status="ready"` and `sweep_ratio <= NEXUS_DB_REPLAY_MAX_SWEEP_RATIO` / `--max-sweep-ratio`.
+
+The CLI is EOD/audit-first, but the evaluator is poll-safe: repeated runs are gated by `live.nexus_db_signal_emission` and existing `live.nexus_strategy_signal` rows. It can therefore be reused by a future realtime worker loop without changing strategy eligibility. It does not publish Redis overlays, execution events, or final `BET` rows; live `BET` remains owned by the Redis Nexus worker.
 
 At runtime Nexus enriches raw option trade events from:
 

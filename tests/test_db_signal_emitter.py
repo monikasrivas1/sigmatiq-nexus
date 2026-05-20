@@ -14,9 +14,12 @@ def _config(**overrides) -> EmitterConfig:
         "database_url": "postgres://example",
         "session_date": "2026-05-20",
         "symbols": ("SPY", "QQQ"),
+        "strategies": ("etf_open_specialist", "etf_low_sweep_core"),
         "min_window_premium": 200_000.0,
         "premium_overrides": {},
         "open_call_dominance": 1.35,
+        "side_dominance": 2.0,
+        "max_sweep_ratio": 0.10,
         "dry_run": False,
         "limit": None,
     }
@@ -34,11 +37,14 @@ def test_candidate_sql_keeps_db_replay_read_only_and_conservative():
     sql = build_candidate_sql(_config())
 
     assert "FROM live.prepared_nexus_window_context" in sql
-    assert "c.window_label = 'w0930_1000'" in sql
+    assert "c.window_label IN ('w0930_1000', 'w1000_1030')" in sql
     assert "c.readiness_status = 'ready'" in sql
     assert "c.daily_context_status IN ('ready', 'healthy')" in sql
     assert "c.final_quote_status = 'fresh_quote_asof_window'" in sql
-    assert "bc.call_premium > bc.put_premium * 1.35::numeric" in sql
+    assert "bw.call_premium > bw.put_premium * 1.35::numeric" in sql
+    assert "'etf_low_sweep_core'::text AS strategy_key" in sql
+    assert "bw.sweep_quality_status = 'ready'" in sql
+    assert "bw.sweep_ratio <= 0.1::numeric" in sql
     assert "INSERT INTO live.nexus_strategy_signal" not in sql
 
 
@@ -50,6 +56,7 @@ def test_emit_sql_uses_idempotent_ledger_before_append_only_signal_insert():
     assert "INSERT INTO live.nexus_strategy_signal" in sql
     assert "'INTERMEDIATE'" in sql
     assert "'sigmatiq_nexus_db_replay'" in sql
+    assert "p.strategy_key" in sql
     assert "LIMIT 3" in sql
     assert json.dumps({"IWM": 75_000.0}) in sql
 
@@ -62,10 +69,27 @@ def test_parse_args_normalizes_symbols_and_requires_iso_date():
         "2026-05-20",
         "--symbols",
         "spy, qqq",
+        "--strategies",
+        "etf_open_specialist",
         "--dry-run",
     ])
 
     assert config.symbols == ("SPY", "QQQ")
+    assert config.strategies == ("etf_open_specialist",)
     assert config.session_date == "2026-05-20"
     assert config.dry_run is True
     assert "host=db" in config.database_url
+
+
+def test_parse_args_rejects_unsupported_strategy():
+    try:
+        parse_args([
+            "--database-url",
+            "postgres://example",
+            "--strategies",
+            "etf_flow_specialist",
+        ])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected unsupported strategy to fail")
