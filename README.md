@@ -119,6 +119,21 @@ nexus-audit-features --symbol SPY --limit 5
 
 The audit reports which implemented strategies are `ready`, `degraded`, or `blocked` based on the sampled trade event plus live IV/GEX context. It also reports `stale` or `unknown_freshness` when a required field exists but cannot be trusted at decision time. The full feature contract is documented in `docs/NEXUS_LIVE_FEATURE_CONTRACT.md`.
 
+## DB Signal-Potential Audit
+
+After or during a session, use the DB-first signal-potential audit to check whether the persisted raw and materialized live tables could have supported Nexus signals:
+
+```bash
+nexus-audit-signal-potential \
+  --session-date 2026-05-20 \
+  --symbols SPY,QQQ,IWM,UVXY \
+  --csv artifacts/nexus_signal_potential_2026-05-20.csv
+```
+
+The audit is read-only. It compares `live.prepared_*` materializer rows and raw-readiness projections against persisted Nexus outputs (`nexus_window_view`, `nexus_strategy_audit`, `nexus_strategy_signal`, and `nexus_spread_signal`). It classifies each symbol/window/strategy as not applicable, blocked by data or an obvious gate, candidate requiring model probability, candidate with unmaterialized Redis-only gate inputs, or candidate that should have reached the final quote gate. It does not run ONNX models or claim exact Redis-only gate outcomes; rows marked `needs_review_no_nexus_output` are the ones to inspect first.
+
+With the live DB materializer replay migration deployed, the audit also reads materialized EOD context values, lead-contract quote-as-of-window fields, replay gate status, and explicit missing-input JSON from `live.prepared_nexus_window_context`. Fields that persisted raw OPRA trades cannot prove, such as sweep and true aggressor classification, stay as warnings instead of simulated green checks.
+
 At runtime Nexus enriches raw option trade events from:
 
 - `equity:live:context:{symbol}` for `underlying_mid` and spot freshness.
