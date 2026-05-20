@@ -68,6 +68,20 @@ def test_window_df_for_slot_filters_session_date():
     assert filtered["premium"].sum() == 150_000
 
 
+def test_live_session_event_guard_rejects_prior_session_events():
+    old_event = datetime(2026, 5, 15, 16, 34, tzinfo=timezone.utc)
+    active_session = date(2026, 5, 19)
+
+    assert nw.is_current_live_session_event(old_event, active_session) is False
+
+
+def test_live_session_event_guard_accepts_active_session_events():
+    active_event = datetime(2026, 5, 19, 14, 34, tzinfo=timezone.utc)
+    active_session = date(2026, 5, 19)
+
+    assert nw.is_current_live_session_event(active_event, active_session) is True
+
+
 def test_window_stats_normalizes_option_side_case():
     df = pl.DataFrame([
         row("2026-05-05T13:35:00Z", "c", 300_000),
@@ -1200,6 +1214,17 @@ def test_publish_window_assessments_writes_no_bet_strategy_audit():
     assert audit["inputs"]["call_premium"] == 200_000.0
     assert audit["inputs"]["put_premium"] == 190_000.0
     assert audit["inputs"]["open_call_dominance_threshold"] == nw.OPEN_CALL_DOMINANCE
+    assert [gate["name"] for gate in audit["gates"]] == [
+        "strategy_window_applicability",
+        "live_feature_quality",
+        "strategy_signal_logic",
+        "bet_escalation",
+    ]
+    signal_gate = next(gate for gate in audit["gates"] if gate["name"] == "strategy_signal_logic")
+    assert signal_gate["severity"] == "soft"
+    assert signal_gate["status"] == "failed"
+    assert signal_gate["hard_block"] is False
+    assert signal_gate["reason"] == "no_open_dominance"
     assert worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "QQQ", "strategy_audit")]
     assert any(fields["redis_key"] == "nexus_strategy_audit:QQQ:etf_open_specialist:10:00" for _, fields, _, _ in worker.redis.xadds)
     assert ("signal:strategy_audit", json.dumps(audit)) in worker.redis.publishes
@@ -1207,6 +1232,7 @@ def test_publish_window_assessments_writes_no_bet_strategy_audit():
     assert view["decision"] == "WINDOW_VIEW"
     assert view["sentiment"] == "CHOP"
     assert view["reason"] == "no_open_dominance"
+    assert view["gates"] == audit["gates"]
 
 
 def test_publish_window_assessments_audits_not_applicable_strategy_lanes():
@@ -1248,6 +1274,24 @@ def test_publish_window_assessments_audits_not_applicable_strategy_lanes():
     assert audit["decision"] == "SKIPPED"
     assert audit["reason"] == "strategy_not_applicable_to_symbol_or_window"
     assert audit["inputs"]["total_premium"] == 200_000.0
+    assert audit["gates"] == [
+        {
+            "name": "strategy_window_applicability",
+            "scope": "strategy",
+            "severity": "observability",
+            "status": "skipped",
+            "hard_block": False,
+            "reason": "strategy_not_applicable_to_symbol_or_window",
+            "details": {
+                "symbol": "IWM",
+                "entry_time": "10:00",
+                "allowed_symbols": ["QQQ", "SPY"],
+                "allowed_entry_times": ["10:00"],
+            },
+        }
+    ]
+    view = json.loads(worker.redis.values["nexus_window_view:IWM:etf_put_credit_open30_spread:10:00"])
+    assert view["gates"] == audit["gates"]
 
 
 def test_publish_window_pricing_sets_key_and_side_summary():
@@ -1782,6 +1826,16 @@ def test_runtime_gate_blocks_low_sweep_when_sweep_classifier_is_missing():
     assert blocked["block_reason"] == "live_feature_quality_gate_closed"
     assert blocked["missing_features"] == ["is_sweep"]
     assert blocked["feature_failures"] == {"is_sweep": "missing"}
+    assert [gate["name"] for gate in blocked["gates"]] == [
+        "strategy_window_applicability",
+        "live_feature_quality",
+    ]
+    feature_gate = next(gate for gate in blocked["gates"] if gate["name"] == "live_feature_quality")
+    assert feature_gate["severity"] == "hard"
+    assert feature_gate["status"] == "failed"
+    assert feature_gate["hard_block"] is True
+    assert feature_gate["reason"] == "live_feature_quality_gate_closed"
+    assert feature_gate["details"]["missing_features"] == ["is_sweep"]
     assert json.loads(worker.redis.sets[0][1]) == blocked
     assert worker.redis.publishes[0][0] == "signal:window_view:etf_low_sweep_core"
 
@@ -2417,6 +2471,7 @@ def test_publish_option_market_context_sets_latest_and_publishes():
     assert msg["schema_version"] == nw.NEXUS_SCHEMA_VERSION
     assert msg["worker_name"] == nw.NEXUS_WORKER_NAME
     assert msg["worker_version"] == nw.NEXUS_WORKER_VERSION
+    assert msg["session_date"] == "2026-05-05"
     assert msg["window_id"] == "w0930_1000"
     assert msg["premium"]["net_premium_bias"] == "call_heavy"
     assert msg["activity"]["trade_count"] == 3

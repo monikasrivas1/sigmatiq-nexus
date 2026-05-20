@@ -31,6 +31,7 @@ NEXUS_HEALTH_SYMBOLS = {
     if s.strip()
 }
 NEXUS_HEALTH_KEY = os.environ.get("NEXUS_HEALTH_KEY", "health:nexus")
+NEXUS_REPLAY_MODE = os.environ.get("NEXUS_REPLAY_MODE", "false").strip().lower() == "true"
 INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM")
 STREAM_START_ID = os.environ.get("NEXUS_STREAM_START_ID", "0-0")
 FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "symbol").strip().lower()
@@ -277,6 +278,86 @@ def strategy_window_view_applicable(strategy: str, symbol: str, slot: dict) -> b
     return symbol in rules["symbols"] and entry_label in rules["entry_labels"]
 
 
+def strategy_gate_audit(
+    strategy: str,
+    symbol: str,
+    slot: dict,
+    decision: str,
+    reason: str,
+    *,
+    inputs: dict | None = None,
+    feature_failures: dict[str, str] | None = None,
+) -> list[dict]:
+    gates = []
+    applicable = strategy_window_view_applicable(strategy, symbol, slot)
+    gates.append({
+        "name": "strategy_window_applicability",
+        "scope": "strategy",
+        "severity": "observability",
+        "status": "passed" if applicable else "skipped",
+        "hard_block": False,
+        "reason": None if applicable else "strategy_not_applicable_to_symbol_or_window",
+        "details": {
+            "symbol": symbol,
+            "entry_time": slot.get("entry_label"),
+            "allowed_symbols": sorted(WINDOW_VIEW_APPLICABILITY.get(strategy, {}).get("symbols", [])),
+            "allowed_entry_times": sorted(WINDOW_VIEW_APPLICABILITY.get(strategy, {}).get("entry_labels", [])),
+        },
+    })
+    if not applicable:
+        return gates
+
+    failures = feature_failures or {}
+    gates.append({
+        "name": "live_feature_quality",
+        "scope": "shared",
+        "severity": "hard",
+        "status": "failed" if failures else "passed",
+        "hard_block": bool(failures),
+        "reason": "live_feature_quality_gate_closed" if failures else None,
+        "details": {
+            "missing_features": sorted(failures.keys()),
+            "feature_failures": failures,
+        },
+    })
+    if failures:
+        return gates
+
+    status = "passed"
+    hard_block = False
+    severity = "soft"
+    if decision == "NO_BET":
+        status = "failed"
+    elif decision in {"BLOCKED", "FINAL_BLOCKED"}:
+        status = "failed"
+        hard_block = True
+        severity = "hard"
+    elif decision == "SKIPPED":
+        status = "skipped"
+    gates.append({
+        "name": "strategy_signal_logic",
+        "scope": "strategy",
+        "severity": severity,
+        "status": status,
+        "hard_block": hard_block,
+        "reason": reason if status in {"failed", "skipped"} else None,
+        "details": inputs or {},
+    })
+    gates.append({
+        "name": "bet_escalation",
+        "scope": "strategy",
+        "severity": "soft",
+        "status": "not_evaluated" if decision == "WINDOW_VIEW" else "failed" if decision == "NO_BET" else "skipped",
+        "hard_block": False,
+        "reason": "window_view_only" if decision == "WINDOW_VIEW" else reason,
+        "details": {
+            "decision": decision,
+            "stage": 0,
+        },
+    })
+    return gates
+
+
 def parse_optional_datetime(value) -> datetime | None:
     if value in (None, ""):
         return None
@@ -402,6 +483,12 @@ def _event_freshness_status(payload: dict, reference_time: datetime | None, feat
 
 def ny_session_date(dt_utc: datetime):
     return dt_utc.astimezone(NY).date()
+
+
+def is_current_live_session_event(event_dt_utc: datetime, active_session_date) -> bool:
+    if NEXUS_REPLAY_MODE:
+        return True
+    return ny_session_date(event_dt_utc) == active_session_date
 
 
 def decision_slot(dt_utc: datetime) -> dict | None:
@@ -1597,6 +1684,7 @@ class SigmatiqNexus:
             "worker_name": NEXUS_WORKER_NAME,
             "worker_version": NEXUS_WORKER_VERSION,
             "symbol": symbol,
+            "session_date": str(session_date),
             "window_id": slot["entry_label"],
             "window_start": slot["window_start"].isoformat(),
             "window_end": slot["window_end"].isoformat(),
@@ -1904,8 +1992,18 @@ class SigmatiqNexus:
 
             payload = await enrich_trade_payload_from_redis(payload, self.redis)
             event_dt_utc = parse_event_datetime(payload)
-            self._record_nexus_input(symbol, stream_name, msg_id=msg_id, event_dt_utc=event_dt_utc)
             self.reset_if_new_session(event_dt_utc)
+            if not is_current_live_session_event(event_dt_utc, self.last_reset_session_date):
+                self._log(
+                    "stale_session_event_ignored",
+                    symbol=symbol,
+                    event_session_date=str(ny_session_date(event_dt_utc)),
+                    active_session_date=str(self.last_reset_session_date),
+                    stream_name=stream_name,
+                    msg_id=str(msg_id) if msg_id is not None else None,
+                )
+                return
+            self._record_nexus_input(symbol, stream_name, msg_id=msg_id, event_dt_utc=event_dt_utc)
 
             # --- DYNAMIC RISK MANAGEMENT (EXIT MONITORING) ---
             if symbol in self.active_positions:
@@ -2533,6 +2631,15 @@ class SigmatiqNexus:
         reported.add(key)
         self.feature_blocks_reported = reported
         missing = sorted(failures.keys())
+        gates = strategy_gate_audit(
+            strategy,
+            symbol,
+            slot,
+            "BLOCKED",
+            "live_feature_quality_gate_closed",
+            inputs=self._window_audit_inputs(pl.DataFrame(), symbol),
+            feature_failures=failures,
+        )
         msg = {
             "strategy": strategy,
             "symbol": symbol,
@@ -2547,6 +2654,7 @@ class SigmatiqNexus:
             "window_start": slot["window_start"].isoformat(),
             "window_end": slot["window_end"].isoformat(),
             "source": "sigmatiq_nexus",
+            "gates": gates,
         }
         msg.update(narratives.build_lifecycle_reason_summary(msg))
         self._log(
@@ -2601,6 +2709,15 @@ class SigmatiqNexus:
             "source": "sigmatiq_nexus",
             "inputs": inputs or {},
         }
+        msg["gates"] = strategy_gate_audit(
+            strategy,
+            symbol,
+            slot,
+            decision,
+            reason,
+            inputs=inputs,
+            feature_failures=feature_failures,
+        )
         if sentiment is not None:
             msg["sentiment"] = sentiment
         if feature_failures:
@@ -2636,6 +2753,7 @@ class SigmatiqNexus:
         session_date,
         evidence: dict | None = None,
         decision: str = "WINDOW_VIEW",
+        gates: list[dict] | None = None,
     ) -> None:
         key = (str(session_date), symbol, strategy, slot["entry_label"])
         reported = getattr(self, "window_views_reported", set())
@@ -2656,6 +2774,10 @@ class SigmatiqNexus:
             "window_end": slot["window_end"].isoformat(),
             "source": "sigmatiq_nexus",
         }
+        if gates is None:
+            gate_inputs = evidence.get("inputs") if isinstance(evidence, dict) and isinstance(evidence.get("inputs"), dict) else evidence
+            gates = strategy_gate_audit(strategy, symbol, slot, decision, reason, inputs=gate_inputs)
+        msg["gates"] = gates
         if sentiment is not None:
             msg["sentiment"] = sentiment
         lead_contract = self._window_lead_contract(getattr(self, "_current_window_df", pl.DataFrame()))
@@ -2826,6 +2948,14 @@ class SigmatiqNexus:
         for strategy, assessor in strategies:
             if not strategy_window_view_applicable(strategy, symbol, slot):
                 inputs = self._window_audit_inputs(df, symbol)
+                gates = strategy_gate_audit(
+                    strategy,
+                    symbol,
+                    slot,
+                    "SKIPPED",
+                    "strategy_not_applicable_to_symbol_or_window",
+                    inputs=inputs,
+                )
                 await self._publish_strategy_audit(
                     strategy,
                     symbol,
@@ -2844,10 +2974,20 @@ class SigmatiqNexus:
                     session_date,
                     evidence={"inputs": inputs},
                     decision="SKIPPED",
+                    gates=gates,
                 )
                 continue
             failures = await self._strategy_feature_failures(strategy, symbol, df, reference_time)
             if failures:
+                gates = strategy_gate_audit(
+                    strategy,
+                    symbol,
+                    slot,
+                    "BLOCKED",
+                    "live_feature_quality_gate_closed",
+                    inputs=self._window_audit_inputs(df, symbol),
+                    feature_failures=failures,
+                )
                 await self._publish_strategy_audit(
                     strategy,
                     symbol,
@@ -2867,6 +3007,15 @@ class SigmatiqNexus:
                 sentiment, reason = result
                 evidence = None
             audit_decision = "NO_BET" if sentiment == "CHOP" else "WINDOW_VIEW"
+            inputs = self._window_audit_inputs(df, symbol, evidence)
+            gates = strategy_gate_audit(
+                strategy,
+                symbol,
+                slot,
+                audit_decision,
+                reason,
+                inputs=inputs,
+            )
             await self._publish_strategy_audit(
                 strategy,
                 symbol,
@@ -2875,9 +3024,9 @@ class SigmatiqNexus:
                 audit_decision,
                 reason,
                 sentiment=sentiment,
-                inputs=self._window_audit_inputs(df, symbol, evidence),
+                inputs=inputs,
             )
-            await self._publish_window_view(strategy, symbol, sentiment, reason, slot, session_date, evidence=evidence)
+            await self._publish_window_view(strategy, symbol, sentiment, reason, slot, session_date, evidence=evidence, gates=gates)
         self._current_window_df = pl.DataFrame()
         self._current_window_pricing_summary = {}
 
