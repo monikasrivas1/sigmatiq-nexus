@@ -27,7 +27,7 @@ Databento / market data
 
 MCP and chat clients should call `sigmatiq-api` endpoints. They should not read Nexus Redis keys directly unless they are operational/debug tooling.
 
-The parallel DB replay path starts from persisted raw/live tables, materializes `live.prepared_nexus_window_context`, and can append DB-proven `INTERMEDIATE` audit candidates to `live.nexus_strategy_signal` with `source="sigmatiq_nexus_db_replay"`. The current EOD/audit CLI supports `etf_open_specialist` and fail-closed `etf_low_sweep_core`; its eligibility query is idempotent and poll-safe so the same logic can be reused by a future realtime worker. It is intentionally not a Redis live-overlay publisher and does not create final `BET` rows.
+The parallel DB replay path starts from persisted raw/live tables, materializes `live.prepared_nexus_window_context`, and can append DB-proven `INTERMEDIATE` audit candidates to `live.nexus_strategy_signal` with `source="sigmatiq_nexus_db_replay"`. The current EOD/audit CLI supports `etf_open_specialist`, fail-closed `etf_low_sweep_core`, and `etf_flow_specialist` heuristic replay. Flow replay requires ready sweep/aggressor classification plus lead-contract Greeks and records that ONNX model scoring was not run in the DB path. Its eligibility query is idempotent and poll-safe so the same logic can be reused by a future realtime worker. It is intentionally not a Redis live-overlay publisher and does not create final `BET` rows.
 
 ## Upstream Inputs Nexus Uses
 

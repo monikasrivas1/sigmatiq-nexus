@@ -12,7 +12,7 @@ from sigmatiq_nexus.signal_potential_audit import normalize_database_url, parse_
 
 
 DEFAULT_SYMBOLS = ("SPY", "QQQ", "IWM", "UVXY")
-DEFAULT_STRATEGIES = ("etf_open_specialist", "etf_low_sweep_core")
+DEFAULT_STRATEGIES = ("etf_open_specialist", "etf_low_sweep_core", "etf_flow_specialist")
 DEFAULT_MIN_WINDOW_PREMIUM = 200_000.0
 DEFAULT_OPEN_CALL_DOMINANCE = 1.35
 DEFAULT_SIDE_DOMINANCE = 2.0
@@ -83,6 +83,7 @@ base_windows AS (
         CASE c.window_label
             WHEN 'w0930_1000' THEN '10:00'
             WHEN 'w1000_1030' THEN '10:30'
+            WHEN 'w1030_1100' THEN '11:00'
             ELSE c.window_label
         END AS entry_time,
         c.window_start_utc,
@@ -101,7 +102,15 @@ base_windows AS (
         c.net_gex,
         c.sweep_ratio,
         c.sweep_quality_status,
+        c.ask_aggressor_premium,
+        c.bid_aggressor_premium,
         c.aggressor_quality_status,
+        c.equity_first_price,
+        c.equity_last_price,
+        c.cheap_side,
+        c.pricing_quality,
+        c.lead_delta,
+        c.lead_gamma,
         c.daily_context_status,
         c.readiness_status,
         c.final_quote_status,
@@ -113,7 +122,7 @@ base_windows AS (
     JOIN requested_symbols s ON s.symbol = c.symbol
     LEFT JOIN premium_overrides po ON po.symbol = c.symbol
     WHERE c.session_date = {session_date}::date
-      AND c.window_label IN ('w0930_1000', 'w1000_1030')
+      AND c.window_label IN ('w0930_1000', 'w1000_1030', 'w1030_1100')
       AND c.readiness_status = 'ready'
       AND c.daily_context_status IN ('ready', 'healthy')
       AND c.final_quote_status = 'fresh_quote_asof_window'
@@ -143,7 +152,15 @@ strategy_candidates AS (
         bw.net_gex,
         bw.sweep_ratio,
         bw.sweep_quality_status,
+        bw.ask_aggressor_premium,
+        bw.bid_aggressor_premium,
         bw.aggressor_quality_status,
+        bw.equity_first_price,
+        bw.equity_last_price,
+        bw.cheap_side,
+        bw.pricing_quality,
+        bw.lead_delta,
+        bw.lead_gamma,
         bw.daily_context_status,
         bw.readiness_status,
         bw.final_quote_status,
@@ -186,7 +203,15 @@ strategy_candidates AS (
         bw.net_gex,
         bw.sweep_ratio,
         bw.sweep_quality_status,
+        bw.ask_aggressor_premium,
+        bw.bid_aggressor_premium,
         bw.aggressor_quality_status,
+        bw.equity_first_price,
+        bw.equity_last_price,
+        bw.cheap_side,
+        bw.pricing_quality,
+        bw.lead_delta,
+        bw.lead_gamma,
         bw.daily_context_status,
         bw.readiness_status,
         bw.final_quote_status,
@@ -224,6 +249,85 @@ strategy_candidates AS (
           (bw.entry_time = '10:30'
            AND bw.put_premium > bw.call_premium * {config.side_dominance}::numeric
            AND bw.lead_option_side = 'P')
+      )
+
+    UNION ALL
+
+    SELECT
+        'etf_flow_specialist'::text AS strategy_key,
+        bw.symbol,
+        bw.session_date,
+        bw.window_label,
+        bw.entry_time,
+        bw.window_start_utc,
+        bw.window_end_utc,
+        bw.total_premium,
+        bw.call_premium,
+        bw.put_premium,
+        bw.option_trade_count,
+        bw.lead_contract_raw_symbol,
+        bw.lead_option_side,
+        bw.lead_quote_ts_utc,
+        bw.lead_quote_mid,
+        bw.lead_quote_age_seconds,
+        bw.iv_rank_pct,
+        bw.atm_iv,
+        bw.net_gex,
+        bw.sweep_ratio,
+        bw.sweep_quality_status,
+        bw.ask_aggressor_premium,
+        bw.bid_aggressor_premium,
+        bw.aggressor_quality_status,
+        bw.equity_first_price,
+        bw.equity_last_price,
+        bw.cheap_side,
+        bw.pricing_quality,
+        bw.lead_delta,
+        bw.lead_gamma,
+        bw.daily_context_status,
+        bw.readiness_status,
+        bw.final_quote_status,
+        bw.replay_gate_status,
+        bw.replay_missing_inputs_json,
+        bw.materialized_at_utc,
+        bw.min_window_premium,
+        CASE WHEN bw.put_premium > bw.call_premium * {config.side_dominance}::numeric THEN 'BEARISH' ELSE 'BULLISH' END AS sentiment,
+        CASE WHEN bw.put_premium > bw.call_premium * {config.side_dominance}::numeric THEN 'flow_put_dominance_context_alignment' ELSE 'flow_call_sweep_alignment' END AS replay_reason,
+        CASE WHEN bw.put_premium > bw.call_premium * {config.side_dominance}::numeric THEN bw.put_premium ELSE bw.call_premium END AS signal_side_premium,
+        round(
+            least(
+                0.99,
+                greatest(
+                    0.60,
+                    0.65 + least(
+                        (CASE WHEN bw.put_premium > bw.call_premium * {config.side_dominance}::numeric THEN bw.put_premium ELSE bw.call_premium END / nullif(bw.total_premium, 0)) - 0.50,
+                        0.30
+                    )
+                )
+            ),
+            4
+        ) AS confidence
+    FROM base_windows bw
+    WHERE bw.entry_time IN ('10:00', '10:30', '11:00')
+      AND bw.total_premium >= bw.min_window_premium
+      AND bw.sweep_quality_status = 'ready'
+      AND bw.aggressor_quality_status = 'ready'
+      AND bw.sweep_ratio IS NOT NULL
+      AND bw.lead_delta IS NOT NULL
+      AND bw.lead_gamma IS NOT NULL
+      AND (
+          (bw.call_premium > bw.put_premium * {config.side_dominance}::numeric
+           AND bw.lead_option_side = 'C'
+           AND bw.iv_rank_pct IS NOT NULL
+           AND bw.iv_rank_pct < 30
+           AND bw.sweep_ratio > {config.max_sweep_ratio}::numeric)
+          OR
+          (bw.put_premium > bw.call_premium * {config.side_dominance}::numeric
+           AND bw.lead_option_side = 'P'
+           AND bw.atm_iv IS NOT NULL
+           AND bw.atm_iv > 0.15
+           AND bw.net_gex IS NOT NULL
+           AND bw.net_gex > -2000000000)
       )
 ),
 eligible AS (
@@ -297,6 +401,8 @@ payloads AS (
                 'call_premium', e.call_premium,
                 'put_premium', e.put_premium,
                 'signal_side_premium', e.signal_side_premium,
+                'ask_aggressor_premium', e.ask_aggressor_premium,
+                'bid_aggressor_premium', e.bid_aggressor_premium,
                 'min_window_premium', e.min_window_premium,
                 'open_call_dominance', {config.open_call_dominance},
                 'side_dominance', {config.side_dominance},
@@ -310,7 +416,14 @@ payloads AS (
                 'replay_missing_inputs', e.replay_missing_inputs_json,
                 'iv_rank_pct', e.iv_rank_pct,
                 'atm_iv', e.atm_iv,
-                'net_gex', e.net_gex
+                'net_gex', e.net_gex,
+                'lead_delta', e.lead_delta,
+                'lead_gamma', e.lead_gamma,
+                'equity_first_price', e.equity_first_price,
+                'equity_last_price', e.equity_last_price,
+                'cheap_side', e.cheap_side,
+                'pricing_quality', e.pricing_quality,
+                'model_status', CASE WHEN e.strategy_key IN ('etf_flow_specialist') THEN 'not_run_db_replay_intermediate_only' ELSE 'not_required' END
             ),
             'reason_summary', 'DB replay found a strategy candidate with persisted window flow, EOD context, and quote-as-of-window evidence. This is an audit candidate, not a Redis live-overlay BET.'
         ) AS payload_json

@@ -14,7 +14,7 @@ def _config(**overrides) -> EmitterConfig:
         "database_url": "postgres://example",
         "session_date": "2026-05-20",
         "symbols": ("SPY", "QQQ"),
-        "strategies": ("etf_open_specialist", "etf_low_sweep_core"),
+        "strategies": ("etf_open_specialist", "etf_low_sweep_core", "etf_flow_specialist"),
         "min_window_premium": 200_000.0,
         "premium_overrides": {},
         "open_call_dominance": 1.35,
@@ -37,7 +37,7 @@ def test_candidate_sql_keeps_db_replay_read_only_and_conservative():
     sql = build_candidate_sql(_config())
 
     assert "FROM live.prepared_nexus_window_context" in sql
-    assert "c.window_label IN ('w0930_1000', 'w1000_1030')" in sql
+    assert "c.window_label IN ('w0930_1000', 'w1000_1030', 'w1030_1100')" in sql
     assert "c.readiness_status = 'ready'" in sql
     assert "c.daily_context_status IN ('ready', 'healthy')" in sql
     assert "c.final_quote_status = 'fresh_quote_asof_window'" in sql
@@ -45,6 +45,10 @@ def test_candidate_sql_keeps_db_replay_read_only_and_conservative():
     assert "'etf_low_sweep_core'::text AS strategy_key" in sql
     assert "bw.sweep_quality_status = 'ready'" in sql
     assert "bw.sweep_ratio <= 0.1::numeric" in sql
+    assert "'etf_flow_specialist'::text AS strategy_key" in sql
+    assert "bw.aggressor_quality_status = 'ready'" in sql
+    assert "bw.lead_delta IS NOT NULL" in sql
+    assert "bw.lead_gamma IS NOT NULL" in sql
     assert "INSERT INTO live.nexus_strategy_signal" not in sql
 
 
@@ -57,6 +61,8 @@ def test_emit_sql_uses_idempotent_ledger_before_append_only_signal_insert():
     assert "'INTERMEDIATE'" in sql
     assert "'sigmatiq_nexus_db_replay'" in sql
     assert "p.strategy_key" in sql
+    assert "model_status" in sql
+    assert "not_run_db_replay_intermediate_only" in sql
     assert "LIMIT 3" in sql
     assert json.dumps({"IWM": 75_000.0}) in sql
 
@@ -87,7 +93,7 @@ def test_parse_args_rejects_unsupported_strategy():
             "--database-url",
             "postgres://example",
             "--strategies",
-            "etf_flow_specialist",
+            "etf_momentum_specialist",
         ])
     except SystemExit as exc:
         assert exc.code == 2
