@@ -18,6 +18,8 @@ Current lock model:
 
 ## Current Nexus Strategies
 
+Strategy capability semantics are defined in `docs/NEXUS_STRATEGY_CAPABILITY_MATRIX.md`. Each strategy payload can expose safe `strategy_read_*` fields so consumers know what the lane is designed to detect before looking at raw strategy details.
+
 | Strategy | Current role | Main decision window | Core idea |
 |---|---:|---:|---|
 | `etf_confluence_sniper` | Phase 1 primary | 10:00-12:30 ET | Flow plus pricing lag plus momentum alignment. |
@@ -425,12 +427,14 @@ Cheap/costly contract and side reads are only emitted when Nexus has point-in-ti
   - Redis key: `nexus_live_overlay:{symbol}`
   - Pub/Sub: `nexus_live_overlay:updates`
   - Payload includes the exact traded `raw_symbol`, `expiry_date`, `strike`, `option_side`, `entry_quote`, `quote_freshness`, `quote_valid_until`, and an `execution` block with the current reference price and max published slippage
+  - Public API/UI payloads must use `trade_expression` and `risk_guidance` instead of raw contract/quote fields. `trade_expression` exposes option type, expiry, and strike; `risk_guidance.max_debit` or `risk_guidance.min_credit` is derived from the internal live contract quote and rounded to the option tick. Do not expose bid/ask/mid, full OPRA symbols, exact live IV/greeks, exact premium totals, or raw option prints to live trader pages.
 - `WINDOW_VIEW`
   - Redis key: `nexus_window_view:{symbol}:{strategy}:{entry_label}`
   - Pub/Sub: `signal:window_view:{strategy}`
   - `BLOCKED` diagnostics use the same key and Pub/Sub family with `decision="BLOCKED"` when a strategy cannot safely form a view because live inputs are missing, stale, or untradable
   - `SKIPPED` diagnostics use the same key and Pub/Sub family with `decision="SKIPPED"` when a strategy lane is not applicable to the symbol or completed window
   - The key family is the complete per-strategy/window ledger. Post-session review should expect one latest row per evaluated `symbol + strategy + entry_label`, not only directional `WINDOW_VIEW` rows.
+  - Live strategy messages include `structural_context`, sourced from Redis primary live keys (`options:live:gex:{symbol}`, `equity:live:context:{symbol}`, and event-risk config keys), with gamma flip, structural pivot, walls, max pain, wall confidence, pinning/acceleration risk, event risk, VWAP, and distance-to-level fields.
 - `WINDOW_PRICING`
   - Redis key: `nexus_window_pricing:{symbol}:{entry_label}`
   - Pub/Sub: `signal:window_pricing`
@@ -451,6 +455,84 @@ Cheap/costly contract and side reads are only emitted when Nexus has point-in-ti
   - Full-session participant flow context for completed 30-minute windows
   - Includes `window_side_read`, `retail_like_flow`, `institutional_like_flow`, `dealer_inferred_pressure`, `dominant_strategy_shape`, `top_contracts`, and `data_quality`
   - v1 publishes `dealer_inferred_pressure` as `unknown` until dealer context reads are wired
+- `REGIME_TIMELINE`
+  - Redis key: `nexus_regime_timeline:{symbol}:{window_label}` and `nexus_regime_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:regime_timeline`
+  - Full-session deterministic regime read for every completed market-context window
+  - Includes `regime`, `confidence`, `maturity`, `reason_codes`, `invalidations`, `inputs`, and `structural_context`
+  - Trend-exhaustion inputs include `session_open_price`, `session_return_pct`, `consecutive_trend_windows`, and `failed_wall_acceptance`
+  - v1 labels include `opening_drive`, `bullish_trend_day`, `bearish_trend_day`, `range_pin_day`, `conflicted_no_trade_day`, `regime_flip_mid_session`, `trend_exhaustion_reversal_risk`, `vol_crush_premium_trap`, `event_news_shock`, and `data_insufficient`
+- `VOLATILITY_TIMELINE`
+  - Redis key: `nexus_volatility_timeline:{symbol}:{window_label}` and `nexus_volatility_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:volatility_timeline`
+  - Full-session deterministic volatility read for every completed market-context window
+  - Includes `volatility_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `inputs`, and `structural_context`
+  - v1 labels include `low_vol_dead_zone`, `fair_premium_tradable_vol`, `high_vol_opportunity`, `vol_crush_premium_trap`, `event_vol_unreliable`, and `stale_unclear_vol`
+- `FLOW_TIMELINE`
+  - Redis key: `nexus_flow_timeline:{symbol}:{window_label}` and `nexus_flow_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:flow_timeline`
+  - Full-session deterministic flow read for every completed market-context window
+  - Includes `flow_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `inputs`, and `structural_context`
+  - v1 labels include `bullish_flow_confirmed`, `bearish_flow_confirmed`, `mixed_flow_no_edge`, `sweep_driven_urgency`, `flow_divergence`, and `weak_or_stale_flow`
+- `PRICE_LOCATION_TIMELINE`
+  - Redis key: `nexus_price_location_timeline:{symbol}:{window_label}` and `nexus_price_location_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:price_location_timeline`
+  - Full-session deterministic structure/timing read for every completed market-context window
+  - Includes `price_location_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `inputs`, and `structural_context`
+  - v1 labels include `pivot_reclaim`, `failed_reclaim`, `near_call_wall`, `near_put_wall`, `near_gamma_flip`, `breakout_acceptance`, `breakdown_acceptance`, `inside_range_chop`, `resistance_test`, `support_test`, `mixed_location`, and `price_location_insufficient`
+  - Live UI payloads should expose labels, distance buckets, and reason codes; do not expose raw live option prints or full level tables.
+- `TRADE_QUALITY_TIMELINE`
+  - Redis key: `nexus_trade_quality_timeline:{symbol}:{window_label}` and `nexus_trade_quality_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:trade_quality_timeline`
+  - Full-session deterministic setup-quality read for every completed market-context window
+  - Includes `trade_quality_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `component_reads`, `inputs`, and `structural_context`
+  - v1 labels include `clean_setup`, `watch_only`, `late_chase_risk`, `bad_pricing`, `conflicted_low_edge`, and `data_insufficient`
+  - This is a summary read over regime, volatility, flow, price location, pricing quality, and event risk; it is not a recommendation to trade.
+- `INVALIDATION_TIMELINE`
+  - Redis key: `nexus_invalidation_timeline:{symbol}:{window_label}` and `nexus_invalidation_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:invalidation_timeline`
+  - Full-session deterministic risk/invalidation read for every completed market-context window
+  - Includes `invalidation_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `component_reads`, `inputs`, and `structural_context`
+  - v1 labels include `pivot_loss_risk`, `vwap_loss_risk`, `pivot_reclaim_risk`, `vwap_reclaim_risk`, `wall_rejection_risk`, `flow_reversal_risk`, `event_invalidated`, and `risk_unclear`
+  - This describes what would invalidate the current read; it does not publish exact stop levels or brokerage instructions.
+- `TIMING_TIMELINE`
+  - Redis key: `nexus_timing_timeline:{symbol}:{window_label}` and `nexus_timing_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:timing_timeline`
+  - Full-session deterministic entry/manage/wait read for every completed market-context window
+  - Includes `timing_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `component_reads`, `inputs`, and `structural_context`
+  - v1 labels include `entry_window`, `wait_window`, `manage_window`, `exit_risk_window`, `too_late_to_chase`, and `timing_unclear`
+  - This describes timing state only; it does not instruct a trader to enter an order.
+- `LIQUIDITY_EXECUTION_TIMELINE`
+  - Redis key: `nexus_liquidity_execution_timeline:{symbol}:{window_label}` and `nexus_liquidity_execution_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:liquidity_execution_timeline`
+  - Full-session deterministic fillability read for every completed market-context window
+  - Includes `liquidity_execution_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `inputs`, and `structural_context`
+  - v1 labels include `tradable`, `wide_spread`, `thin_liquidity`, `stale_quote`, and `execution_unclear`
+  - This summarizes execution quality without exposing raw live bid/ask, mid, greeks, contract prints, or premium totals.
+- `EVENT_RELIABILITY_TIMELINE`
+  - Redis key: `nexus_event_reliability_timeline:{symbol}:{window_label}` and `nexus_event_reliability_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:event_reliability_timeline`
+  - Full-session deterministic event/data reliability read for every completed market-context window
+  - Includes `event_reliability_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `inputs`, and `structural_context`
+  - v1 labels include `normal_reliability`, `event_watch`, `event_active`, and `data_unreliable`
+  - This tells consumers whether market reads are reliable enough to interpret, not whether a trade is valid.
+- `POSITION_MANAGEMENT_TIMELINE`
+  - Redis key: `nexus_position_management_timeline:{symbol}:{window_label}` and `nexus_position_management_timeline:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
+  - Pub/Sub: `signal:position_management_timeline`
+  - Full-session deterministic management read for every completed market-context window
+  - Includes `position_management_label`, `confidence`, `maturity`, `reason_codes`, `strategy_implications`, `component_reads`, `inputs`, and `structural_context`
+  - v1 labels include `hold`, `trim`, `trail`, `exit_risk`, and `stand_down`
+  - This is a planning read for exposure management; it is not an instruction to hold, close, or adjust a brokerage position.
 - `HEALTH`
   - Redis key: `health:nexus` unless `NEXUS_HEALTH_KEY` overrides it
   - Source scope: `NEXUS_HEALTH_SYMBOLS`, default `SPY,QQQ,IWM,UVXY`

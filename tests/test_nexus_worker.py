@@ -230,6 +230,24 @@ def test_contract_details_from_raw_symbol_parses_expiry_strike_and_side():
     }
 
 
+def test_risk_guidance_uses_one_percent_limit_and_option_tick():
+    guidance = nw._risk_guidance_from_price(1.35)
+
+    assert guidance["max_debit"] == 1.37
+    assert guidance["max_risk_per_contract"] == 137.0
+    assert guidance["sizing_note"] == "Do not pay above $1.37."
+
+
+def test_safe_trade_expression_exposes_strike_expiry_without_raw_symbol():
+    expression = nw._safe_trade_expression("SPY   260505C00719000")
+
+    assert expression == {
+        "option_type": "CALL",
+        "expiry": "2026-05-05",
+        "strike": 719.0,
+    }
+
+
 def test_raw_symbol_with_strike_rewrites_opra_strike():
     assert nw._raw_symbol_with_strike("SPY   260505P00715000", 710.0) == "SPY260505P00710000"
     assert nw._raw_symbol_with_strike("SPY   260505C00715000", 720.0) == "SPY260505C00720000"
@@ -358,6 +376,47 @@ def test_context_uses_canonical_live_keys():
     assert atm_iv == 0.42
     assert net_gex == -1250000
     assert status == {"iv_rank": "available", "atm_iv": "available", "net_gex": "available"}
+
+
+def test_structural_context_uses_primary_redis_live_keys():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "symbol": "SPY",
+            "tsUtc": "2026-05-05T14:00:00Z",
+            "netGex": -1250000,
+            "gammaFlipExact": 512.5,
+            "gammaFlip": 511.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "maxPainStrike": 510.0,
+            "wallConfidence": 0.82,
+            "pinningScore": 0.31,
+            "accelerationRiskScore": 0.64,
+        }),
+        "equity:live:context:SPY": json.dumps({
+            "symbol": "SPY",
+            "lastPriceUtc": "2026-05-05T14:00:00Z",
+            "warmupComplete": True,
+            "price": 515.0,
+            "vwap": 513.0,
+        }),
+        "config:live:event_risk:SPY": json.dumps({"event_risk": "elevated"}),
+    })
+
+    context = asyncio.run(
+        worker.get_structural_context("SPY", datetime(2026, 5, 5, 14, 0, 30, tzinfo=timezone.utc))
+    )
+
+    assert context["source"] == "redis_live"
+    assert context["net_gex"] == -1250000
+    assert context["structural_pivot"] == 512.5
+    assert context["call_wall"] == 520.0
+    assert context["put_wall"] == 500.0
+    assert context["event_risk"] == "elevated"
+    assert context["equity_vwap"] == 513.0
+    assert round(context["distance_to_call_wall_pct"], 4) == round(((520.0 - 515.0) / 515.0) * 100.0, 4)
+    assert context["feature_status"] == {"gex": "available", "equity": "available", "event_risk": "available"}
 
 
 def test_vrp_payload_without_rank_does_not_satisfy_iv_rank():
@@ -1235,6 +1294,649 @@ def test_publish_window_assessments_writes_no_bet_strategy_audit():
     assert view["gates"] == audit["gates"]
 
 
+def test_publish_regime_timeline_writes_all_day_window_payload():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "maxPainStrike": 510.0,
+            "pinningScore": 0.65,
+            "tsUtc": "2026-05-05T15:00:00Z",
+        }),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T16:30:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:05:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 514.8,
+                "underlying_ts_utc": "2026-05-05T16:05:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505P00515000",
+                "ts_utc": "2026-05-05T16:10:00Z",
+                "side": "P",
+                "price": 2.0,
+                "size": 450,
+                "premium": 90_000,
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T16:10:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+        ])
+    }
+    worker.regime_timeline_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+
+    asyncio.run(worker.publish_regime_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[5],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 16, 31, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_regime_timeline:SPY:w1200_1230"])
+    assert payload["kind"] == "nexus_regime_timeline"
+    assert payload["regime"] == "range_pin_day"
+    assert payload["window_label"] == "w1200_1230"
+    assert payload["inputs"]["session_open_price"] == 514.8
+    assert payload["inputs"]["session_return_pct"] > 0
+    assert payload["inputs"]["consecutive_trend_windows"] == 1
+    assert payload["inputs"]["failed_wall_acceptance"] is False
+    assert payload["structural_context"]["structural_pivot"] == 514.0
+    assert worker.redis.values["nexus_regime_timeline:SPY:latest"]
+    assert "w1200_1230" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "regime_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:regime_timeline"
+
+
+def test_publish_volatility_timeline_writes_all_day_window_payload():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "tsUtc": "2026-05-05T15:00:00Z",
+        }),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 52.0, "asOf": "2026-05-05T16:30:00Z"}),
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.22, "asOf": "2026-05-05T16:30:00Z"}),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T16:30:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:05:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 514.8,
+                "underlying_ts_utc": "2026-05-05T16:05:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505P00515000",
+                "ts_utc": "2026-05-05T16:10:00Z",
+                "side": "P",
+                "price": 2.0,
+                "size": 450,
+                "premium": 90_000,
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T16:10:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+        ])
+    }
+    worker.volatility_timeline_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    worker._window_pricing_summary = lambda df: {"pricing_quality": "ready"}
+
+    asyncio.run(worker.publish_volatility_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[5],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 16, 31, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_volatility_timeline:SPY:w1200_1230"])
+    assert payload["kind"] == "nexus_volatility_timeline"
+    assert payload["volatility_label"] == "high_vol_opportunity"
+    assert payload["inputs"]["iv_rank_pct"] == 52.0
+    assert payload["inputs"]["atm_iv"] == 0.22
+    assert worker.redis.values["nexus_volatility_timeline:SPY:latest"]
+    assert "w1200_1230" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "volatility_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:volatility_timeline"
+
+
+def test_publish_flow_timeline_writes_all_day_window_payload():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "tsUtc": "2026-05-05T16:30:00Z",
+        }),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T16:30:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:05:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 800,
+                "premium": 160_000,
+                "is_sweep": False,
+                "aggressor": "A",
+                "underlying_mid": 514.8,
+                "underlying_ts_utc": "2026-05-05T16:05:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505P00515000",
+                "ts_utc": "2026-05-05T16:10:00Z",
+                "side": "P",
+                "price": 2.0,
+                "size": 350,
+                "premium": 70_000,
+                "is_sweep": False,
+                "aggressor": "B",
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T16:10:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+        ])
+    }
+    worker.flow_timeline_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    worker._window_pricing_summary = lambda df: {"pricing_quality": "ready"}
+
+    asyncio.run(worker.publish_flow_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[5],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 16, 31, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_flow_timeline:SPY:w1200_1230"])
+    assert payload["kind"] == "nexus_flow_timeline"
+    assert payload["flow_label"] == "bullish_flow_confirmed"
+    assert payload["inputs"]["call_premium"] == 160_000
+    assert payload["inputs"]["ask_aggressor_premium"] == 160_000
+    assert worker.redis.values["nexus_flow_timeline:SPY:latest"]
+    assert "w1200_1230" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "flow_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:flow_timeline"
+
+
+def test_publish_price_location_timeline_writes_all_day_window_payload():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 512.0,
+            "structuralPivot": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "tsUtc": "2026-05-05T16:30:00Z",
+        }),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T16:30:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:05:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 513.8,
+                "underlying_ts_utc": "2026-05-05T16:05:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:10:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T16:10:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+            }),
+        ])
+    }
+    worker.price_location_timeline_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    worker._window_pricing_summary = lambda df: {"pricing_quality": "ready"}
+
+    asyncio.run(worker.publish_price_location_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[5],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 16, 31, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_price_location_timeline:SPY:w1200_1230"])
+    assert payload["kind"] == "nexus_price_location_timeline"
+    assert payload["price_location_label"] == "pivot_reclaim"
+    assert payload["inputs"]["session_open_price"] == 513.8
+    assert worker.redis.values["nexus_price_location_timeline:SPY:latest"]
+    assert "w1200_1230" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "price_location_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:price_location_timeline"
+
+
+def test_publish_trade_quality_timeline_writes_all_day_window_payload():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 512.0,
+            "structuralPivot": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "tsUtc": "2026-05-05T16:30:00Z",
+        }),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 35.0, "asOf": "2026-05-05T16:30:00Z"}),
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.20, "asOf": "2026-05-05T16:30:00Z"}),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T16:30:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:05:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 513.8,
+                "underlying_ts_utc": "2026-05-05T16:05:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:10:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T16:10:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+        ])
+    }
+    worker.trade_quality_timeline_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    worker._window_pricing_summary = lambda df: {"pricing_quality": "ready"}
+
+    asyncio.run(worker.publish_trade_quality_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[5],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 16, 31, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_trade_quality_timeline:SPY:w1200_1230"])
+    assert payload["kind"] == "nexus_trade_quality_timeline"
+    assert payload["trade_quality_label"] == "clean_setup"
+    assert payload["component_reads"]["flow_label"] == "bullish_flow_confirmed"
+    assert worker.redis.values["nexus_trade_quality_timeline:SPY:latest"]
+    assert "w1200_1230" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "trade_quality_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:trade_quality_timeline"
+
+
+def test_publish_invalidation_timeline_writes_all_day_window_payload():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 512.0,
+            "structuralPivot": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "tsUtc": "2026-05-05T16:30:00Z",
+        }),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 35.0, "asOf": "2026-05-05T16:30:00Z"}),
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.20, "asOf": "2026-05-05T16:30:00Z"}),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T16:30:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:05:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 513.8,
+                "underlying_ts_utc": "2026-05-05T16:05:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T16:10:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T16:10:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+        ])
+    }
+    worker.invalidation_timeline_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    worker._window_pricing_summary = lambda df: {"pricing_quality": "ready"}
+
+    asyncio.run(worker.publish_invalidation_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[5],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 16, 31, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_invalidation_timeline:SPY:w1200_1230"])
+    assert payload["kind"] == "nexus_invalidation_timeline"
+    assert payload["invalidation_label"] == "pivot_loss_risk"
+    assert payload["component_reads"]["trade_quality_label"] == "clean_setup"
+    assert worker.redis.values["nexus_invalidation_timeline:SPY:latest"]
+    assert "w1200_1230" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "invalidation_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:invalidation_timeline"
+
+
+def test_publish_timing_timeline_writes_all_day_window_payload():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 512.0,
+            "structuralPivot": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "tsUtc": "2026-05-05T15:00:00Z",
+        }),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 35.0, "asOf": "2026-05-05T15:00:00Z"}),
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.20, "asOf": "2026-05-05T15:00:00Z"}),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T15:00:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T14:35:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 513.8,
+                "underlying_ts_utc": "2026-05-05T14:35:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T14:40:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T14:40:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+        ])
+    }
+    worker.timing_timeline_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    worker._window_pricing_summary = lambda df: {"pricing_quality": "ready"}
+
+    asyncio.run(worker.publish_timing_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[2],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 15, 1, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_timing_timeline:SPY:w1030_1100"])
+    assert payload["kind"] == "nexus_timing_timeline"
+    assert payload["timing_label"] == "entry_window"
+    assert payload["component_reads"]["invalidation_label"] == "pivot_loss_risk"
+    assert worker.redis.values["nexus_timing_timeline:SPY:latest"]
+    assert "w1030_1100" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "timing_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:timing_timeline"
+
+
+def _timeline_worker_for_completed_window():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": 1_000_000,
+            "gammaFlipExact": 512.0,
+            "structuralPivot": 514.0,
+            "callWall": 520.0,
+            "putWall": 500.0,
+            "tsUtc": "2026-05-05T15:00:00Z",
+        }),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 35.0, "asOf": "2026-05-05T15:00:00Z"}),
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.20, "asOf": "2026-05-05T15:00:00Z"}),
+        "equity:live:context:SPY": json.dumps({
+            "price": 515.2,
+            "vwap": 514.7,
+            "lastPriceUtc": "2026-05-05T15:00:00Z",
+            "warmupComplete": True,
+        }),
+        "config:live:event_risk:global": json.dumps({"event_risk": "normal"}),
+    })
+    worker.buffers = {
+        "SPY": deque([
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T14:35:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 513.8,
+                "underlying_ts_utc": "2026-05-05T14:35:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "tradability_bucket": "good",
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00515000",
+                "ts_utc": "2026-05-05T14:40:00Z",
+                "side": "C",
+                "price": 2.0,
+                "size": 500,
+                "premium": 100_000,
+                "underlying_mid": 515.2,
+                "underlying_ts_utc": "2026-05-05T14:40:00Z",
+                "option_mid": 2.0,
+                "quote_age_ms": 100,
+                "tradability_bucket": "good",
+                "is_sweep": False,
+                "aggressor": "A",
+            }),
+        ])
+    }
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    worker._window_pricing_summary = lambda df: {"pricing_quality": "usable"}
+    return worker
+
+
+def test_publish_liquidity_execution_timeline_writes_all_day_window_payload():
+    worker = _timeline_worker_for_completed_window()
+    worker.liquidity_execution_timeline_reported = set()
+
+    asyncio.run(worker.publish_liquidity_execution_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[2],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 15, 1, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_liquidity_execution_timeline:SPY:w1030_1100"])
+    assert payload["kind"] == "nexus_liquidity_execution_timeline"
+    assert payload["liquidity_execution_label"] == "tradable"
+    assert payload["inputs"]["max_quote_age_ms"] == 100
+    assert worker.redis.values["nexus_liquidity_execution_timeline:SPY:latest"]
+    assert "w1030_1100" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "liquidity_execution_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:liquidity_execution_timeline"
+
+
+def test_publish_event_reliability_timeline_writes_all_day_window_payload():
+    worker = _timeline_worker_for_completed_window()
+    worker.event_reliability_timeline_reported = set()
+
+    asyncio.run(worker.publish_event_reliability_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[2],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 15, 1, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_event_reliability_timeline:SPY:w1030_1100"])
+    assert payload["kind"] == "nexus_event_reliability_timeline"
+    assert payload["event_reliability_label"] == "normal_reliability"
+    assert payload["inputs"]["event_risk"] == "normal"
+    assert worker.redis.values["nexus_event_reliability_timeline:SPY:latest"]
+    assert "w1030_1100" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "event_reliability_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:event_reliability_timeline"
+
+
+def test_publish_position_management_timeline_writes_all_day_window_payload():
+    worker = _timeline_worker_for_completed_window()
+    worker.position_management_timeline_reported = set()
+
+    asyncio.run(worker.publish_position_management_timeline_for_slot(
+        "SPY",
+        nw.MARKET_CONTEXT_WINDOWS[2],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 15, 1, tzinfo=timezone.utc),
+    ))
+
+    payload = json.loads(worker.redis.values["nexus_position_management_timeline:SPY:w1030_1100"])
+    assert payload["kind"] == "nexus_position_management_timeline"
+    assert payload["position_management_label"] == "hold"
+    assert payload["component_reads"]["liquidity_execution_label"] == "tradable"
+    assert payload["component_reads"]["event_reliability_label"] == "normal_reliability"
+    assert worker.redis.values["nexus_position_management_timeline:SPY:latest"]
+    assert "w1030_1100" in worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "position_management_timeline")]
+    assert worker.redis.publishes[-1][0] == "signal:position_management_timeline"
+
+
 def test_publish_window_assessments_audits_not_applicable_strategy_lanes():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.redis = FakeRedis({
@@ -1824,6 +2526,8 @@ def test_runtime_gate_blocks_low_sweep_when_sweep_classifier_is_missing():
     blocked = json.loads(worker.redis.xadds[0][1]["payload_json"])
     assert blocked["decision"] == "BLOCKED"
     assert blocked["block_reason"] == "live_feature_quality_gate_closed"
+    assert blocked["strategy_read_label"] == "clean_directional_flow_blocked"
+    assert blocked["strategy_action"] == "blocked"
     assert blocked["missing_features"] == ["is_sweep"]
     assert blocked["feature_failures"] == {"is_sweep": "missing"}
     assert [gate["name"] for gate in blocked["gates"]] == [

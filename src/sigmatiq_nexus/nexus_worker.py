@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import ssl
 from collections import deque
@@ -20,6 +21,19 @@ from redis.asyncio.cluster import RedisCluster
 
 from sigmatiq_nexus import narratives
 from sigmatiq_nexus import participant_flow as pf
+from sigmatiq_nexus.regime_classifier import (
+    classify_event_reliability,
+    classify_flow,
+    classify_invalidation,
+    classify_liquidity_execution,
+    classify_position_management,
+    classify_price_location,
+    classify_regime,
+    classify_timing,
+    classify_trade_quality,
+    classify_volatility,
+)
+from sigmatiq_nexus.strategy_read import classify_strategy_read
 
 # --- CONFIGURATION ---
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -67,6 +81,8 @@ IV_SURFACE_KEY_TEMPLATE = os.environ.get("NEXUS_IV_SURFACE_KEY", "options:live:i
 VRP_KEY_TEMPLATE = os.environ.get("NEXUS_VRP_KEY", "options:live:vrp:{symbol}")
 GEX_KEY_TEMPLATE = os.environ.get("NEXUS_GEX_KEY", "options:live:gex:{symbol}")
 EQUITY_CONTEXT_KEY_TEMPLATE = os.environ.get("NEXUS_EQUITY_CONTEXT_KEY", "equity:live:context:{symbol}")
+EVENT_RISK_GLOBAL_KEY = os.environ.get("EVENT_RISK_GLOBAL_KEY", "config:live:event_risk:global")
+EVENT_RISK_SYMBOL_PREFIX = os.environ.get("EVENT_RISK_SYMBOL_PREFIX", "config:live:event_risk:")
 CONTRACT_STATE_KEY_TEMPLATE = os.environ.get("NEXUS_CONTRACT_STATE_KEY", "options:live:contract_state:{raw_symbol}")
 CONTRACT_TRADABILITY_KEY_TEMPLATE = os.environ.get("NEXUS_CONTRACT_TRADABILITY_KEY", "options:live:tradability:{raw_symbol}")
 NEXUS_REQUIRE_CONTEXT_TIMESTAMPS = os.environ.get("NEXUS_REQUIRE_CONTEXT_TIMESTAMPS", "true").strip().lower() == "true"
@@ -88,6 +104,7 @@ STOP_LOSS_PCT = float(os.environ.get("NEXUS_STOP_LOSS_PCT", "-50.0"))
 GUARD_ACTIVATE_PCT = float(os.environ.get("NEXUS_GUARD_ACTIVATE_PCT", "15.0"))
 GUARD_FLOOR_PCT = float(os.environ.get("NEXUS_GUARD_FLOOR_PCT", "5.0"))
 EXECUTION_MAX_SLIPPAGE_PCT = float(os.environ.get("NEXUS_EXECUTION_MAX_SLIPPAGE_PCT", "5.0"))
+ENTRY_LIMIT_TOLERANCE_PCT = float(os.environ.get("NEXUS_ENTRY_LIMIT_TOLERANCE_PCT", "1.0"))
 SPREAD_STRIKE_WIDTH = float(os.environ.get("NEXUS_SPREAD_STRIKE_WIDTH", "5.0"))
 SPREAD_TARGET_DELTA = float(os.environ.get("NEXUS_SPREAD_TARGET_DELTA", "0.15"))
 SPREAD_MIN_ENTRY_CREDIT = float(os.environ.get("NEXUS_SPREAD_MIN_ENTRY_CREDIT", "0.30"))
@@ -452,6 +469,59 @@ def _quote_execution_snapshot(quote: dict | None, reference_time: datetime | Non
     }
 
 
+def _round_option_limit(value: float | None) -> float | None:
+    if value is None or value <= 0:
+        return None
+    tick = 0.01 if value < 3 else 0.05
+    return round(math.ceil(value / tick) * tick, 2)
+
+
+def _round_option_floor(value: float | None) -> float | None:
+    if value is None or value <= 0:
+        return None
+    tick = 0.01 if value < 3 else 0.05
+    return round(math.floor(value / tick) * tick, 2)
+
+
+def _safe_trade_expression(raw_symbol: str | None) -> dict:
+    details = _contract_details_from_raw_symbol(raw_symbol)
+    option_side = details.get("side")
+    return {
+        "option_type": "CALL" if option_side == "C" else "PUT" if option_side == "P" else None,
+        "expiry": details.get("expiry_date"),
+        "strike": details.get("strike"),
+    }
+
+
+def _risk_guidance_from_price(reference_price: float | None, *, side: str = "debit") -> dict:
+    if reference_price is None or reference_price <= 0:
+        return {
+            "order_type": "limit",
+            "price_reference": "derived_from_live_contract_quote",
+            "limit_tolerance_pct": ENTRY_LIMIT_TOLERANCE_PCT,
+            "sizing_note": "Limit guidance unavailable until a fresh contract quote is available.",
+        }
+    if side == "credit":
+        min_credit = _round_option_floor(reference_price * (1 - ENTRY_LIMIT_TOLERANCE_PCT / 100.0))
+        return {
+            "order_type": "limit",
+            "price_reference": "derived_from_live_contract_quote",
+            "limit_tolerance_pct": ENTRY_LIMIT_TOLERANCE_PCT,
+            "min_credit": min_credit,
+            "max_risk_per_contract": round(reference_price * 100.0, 2),
+            "sizing_note": f"Do not sell below ${min_credit:.2f}." if min_credit is not None else "Do not chase poor fills.",
+        }
+    max_debit = _round_option_limit(reference_price * (1 + ENTRY_LIMIT_TOLERANCE_PCT / 100.0))
+    return {
+        "order_type": "limit",
+        "price_reference": "derived_from_live_contract_quote",
+        "limit_tolerance_pct": ENTRY_LIMIT_TOLERANCE_PCT,
+        "max_debit": max_debit,
+        "max_risk_per_contract": round(max_debit * 100.0, 2) if max_debit is not None else None,
+        "sizing_note": f"Do not pay above ${max_debit:.2f}." if max_debit is not None else "Do not chase above the limit.",
+    }
+
+
 def _event_freshness_status(payload: dict, reference_time: datetime | None, feature: str) -> str:
     if feature == "underlying_mid":
         if _payload_bool(payload, "underlying_data_stale", "underlyingDataStale", "priceDataStale", "price_data_stale"):
@@ -571,7 +641,7 @@ def nexus_index_key(session_date, symbol: str, kind: str) -> str:
     """Per-(session_date, symbol) index set used by sigmatiq-api to enumerate
     Nexus messages without scanning Redis. ``kind`` is one of ``strategy_audit``,
     ``window_view``, ``intermediate``, ``spread``, ``pricing``, ``late_event``,
-    ``omc``, ``participant_flow``, ``final_block``."""
+    ``omc``, ``participant_flow``, ``regime_timeline``, ``volatility_timeline``, ``flow_timeline``, ``price_location_timeline``, ``trade_quality_timeline``, ``invalidation_timeline``, ``timing_timeline``, ``liquidity_execution_timeline``, ``event_reliability_timeline``, ``position_management_timeline``, ``final_block``."""
     return f"nexus:index:{session_date}:{symbol}:{kind}"
 
 
@@ -617,6 +687,26 @@ def nexus_output_family(redis_key: str) -> str | None:
         return "option_market_context"
     if redis_key.startswith("nexus_participant_flow_context:"):
         return "participant_flow_context"
+    if redis_key.startswith("nexus_regime_timeline:"):
+        return "regime_timeline"
+    if redis_key.startswith("nexus_volatility_timeline:"):
+        return "volatility_timeline"
+    if redis_key.startswith("nexus_flow_timeline:"):
+        return "flow_timeline"
+    if redis_key.startswith("nexus_price_location_timeline:"):
+        return "price_location_timeline"
+    if redis_key.startswith("nexus_trade_quality_timeline:"):
+        return "trade_quality_timeline"
+    if redis_key.startswith("nexus_invalidation_timeline:"):
+        return "invalidation_timeline"
+    if redis_key.startswith("nexus_timing_timeline:"):
+        return "timing_timeline"
+    if redis_key.startswith("nexus_liquidity_execution_timeline:"):
+        return "liquidity_execution_timeline"
+    if redis_key.startswith("nexus_event_reliability_timeline:"):
+        return "event_reliability_timeline"
+    if redis_key.startswith("nexus_position_management_timeline:"):
+        return "position_management_timeline"
     return None
 
 
@@ -634,6 +724,16 @@ def nexus_output_symbol(redis_key: str) -> str | None:
         "nexus_final_block",
         "nexus_option_market_context",
         "nexus_participant_flow_context",
+        "nexus_regime_timeline",
+        "nexus_volatility_timeline",
+        "nexus_flow_timeline",
+        "nexus_price_location_timeline",
+        "nexus_trade_quality_timeline",
+        "nexus_invalidation_timeline",
+        "nexus_timing_timeline",
+        "nexus_liquidity_execution_timeline",
+        "nexus_event_reliability_timeline",
+        "nexus_position_management_timeline",
     }:
         return parts[1].strip().upper() or None
     return None
@@ -731,6 +831,12 @@ def _payload_float(payload: dict, *names: str) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _signed_distance_pct(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return (numerator / denominator) * 100.0
 
 
 def _payload_bool(payload: dict, *names: str) -> bool | None:
@@ -1067,9 +1173,17 @@ def _set_enriched_timestamp(payload: dict, field: str, value, freshness_fields: 
 def _merge_underlying_context(payload: dict, context: dict) -> None:
     if not context:
         return
-    price = _payload_float(context, "price", "lastTradePrice", "close")
+    price = _payload_float(context, "price", "lastPrice", "last_price", "lastTradePrice", "last_trade_price", "close")
     if price is not None and price > 0:
         _set_enriched_value(payload, "underlying_mid", price)
+    vwap = _payload_float(context, "vwap", "equityVwap", "equity_vwap")
+    if vwap is not None and vwap > 0:
+        payload.setdefault("equity_vwap", vwap)
+    distance_to_vwap = _payload_float(context, "distanceToVwapPct", "distance_to_vwap_pct")
+    if distance_to_vwap is None:
+        distance_to_vwap = _signed_distance_pct((price - vwap) if price is not None and vwap is not None else None, vwap)
+    if distance_to_vwap is not None:
+        payload.setdefault("distance_to_vwap_pct", distance_to_vwap)
     ts = _payload_value(context, "lastPriceUtc", "last_price_utc", "lastTradeUtc", "last_trade_utc", "tsUtc", "ts_utc")
     if ts is not None:
         _set_enriched_timestamp(payload, "underlying_ts_utc", ts, "underlying_mid")
@@ -1189,6 +1303,16 @@ class SigmatiqNexus:
         self.window_pricing_reported = set()
         self.option_market_context_reported = set()
         self.participant_flow_reported = set()
+        self.regime_timeline_reported = set()
+        self.volatility_timeline_reported = set()
+        self.flow_timeline_reported = set()
+        self.price_location_timeline_reported = set()
+        self.trade_quality_timeline_reported = set()
+        self.invalidation_timeline_reported = set()
+        self.timing_timeline_reported = set()
+        self.liquidity_execution_timeline_reported = set()
+        self.event_reliability_timeline_reported = set()
+        self.position_management_timeline_reported = set()
         self.evaluated_windows = set()
         self.late_window_impacts = {}
         self.health_state = self._empty_health_state()
@@ -1367,6 +1491,16 @@ class SigmatiqNexus:
                 "final_block",
                 "option_market_context",
                 "participant_flow_context",
+                "regime_timeline",
+                "volatility_timeline",
+                "flow_timeline",
+                "price_location_timeline",
+                "trade_quality_timeline",
+                "invalidation_timeline",
+                "timing_timeline",
+                "liquidity_execution_timeline",
+                "event_reliability_timeline",
+                "position_management_timeline",
             ],
             "persistenceStream": LIVE_PERSISTENCE_EVENT_STREAM,
             "perSymbol": per_symbol,
@@ -1806,6 +1940,16 @@ class SigmatiqNexus:
             self.window_pricing_reported.clear()
             self.option_market_context_reported.clear()
             self.participant_flow_reported.clear()
+            getattr(self, "regime_timeline_reported", set()).clear()
+            getattr(self, "volatility_timeline_reported", set()).clear()
+            getattr(self, "flow_timeline_reported", set()).clear()
+            getattr(self, "price_location_timeline_reported", set()).clear()
+            getattr(self, "trade_quality_timeline_reported", set()).clear()
+            getattr(self, "invalidation_timeline_reported", set()).clear()
+            getattr(self, "timing_timeline_reported", set()).clear()
+            getattr(self, "liquidity_execution_timeline_reported", set()).clear()
+            getattr(self, "event_reliability_timeline_reported", set()).clear()
+            getattr(self, "position_management_timeline_reported", set()).clear()
             self.evaluated_windows.clear()
             self.late_window_impacts.clear()
             self.last_reset_session_date = current_session_date
@@ -2136,6 +2280,17 @@ class SigmatiqNexus:
             if latest_market_context_slot:
                 await self.publish_option_market_context_for_slot(symbol, latest_market_context_slot, session_date)
                 await self.publish_participant_flow_context_for_slot(symbol, latest_market_context_slot, session_date)
+                if getattr(self, "redis", None):
+                    await self.publish_regime_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_volatility_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_flow_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_price_location_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_trade_quality_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_invalidation_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_timing_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_liquidity_execution_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_event_reliability_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
+                    await self.publish_position_management_timeline_for_slot(symbol, latest_market_context_slot, session_date, reference_dt_utc)
             if latest_decision_slot:
                 slot = latest_decision_slot
                 key = window_eval_key(session_date, symbol, slot["entry_label"])
@@ -2528,6 +2683,59 @@ class SigmatiqNexus:
             context_status["iv_rank"] = self._context_freshness_status(payload, reference_time, "iv_rank")
         return iv_rank, atm_iv, net_gex, context_status
 
+    async def get_structural_context(self, symbol: str, reference_time: datetime | None = None) -> dict:
+        symbol = symbol.upper()
+        gex_payload, equity_payload, symbol_event_payload, global_event_payload = await asyncio.gather(
+            read_json_payload(self.redis, GEX_KEY_TEMPLATE.format(symbol=symbol)),
+            read_json_payload(self.redis, EQUITY_CONTEXT_KEY_TEMPLATE.format(symbol=symbol)),
+            read_json_payload(self.redis, f"{EVENT_RISK_SYMBOL_PREFIX}{symbol}"),
+            read_json_payload(self.redis, EVENT_RISK_GLOBAL_KEY),
+        )
+        spot = _payload_float(equity_payload, "price", "lastPrice", "last_price", "lastTradePrice", "last_trade_price", "underlying_mid")
+        equity_vwap = _payload_float(equity_payload, "vwap", "equityVwap", "equity_vwap")
+        gamma_flip_exact = _payload_float(gex_payload, "gammaFlipExact", "gamma_flip_exact")
+        gamma_flip = _payload_float(gex_payload, "gammaFlip", "gamma_flip")
+        hybrid_gamma_flip = _payload_float(gex_payload, "hybridGammaFlip", "hybrid_gamma_flip")
+        gamma_flip_level = next(
+            (value for value in (gamma_flip_exact, gamma_flip, hybrid_gamma_flip) if value is not None),
+            None,
+        )
+        call_wall = _payload_float(gex_payload, "callWall", "call_wall")
+        put_wall = _payload_float(gex_payload, "putWall", "put_wall")
+        max_pain = _payload_float(gex_payload, "maxPainStrike", "max_pain_strike", "maxPain", "max_pain")
+        explicit_pivot = _payload_float(gex_payload, "structuralPivot", "structural_pivot")
+        structural_pivot = next(
+            (value for value in (explicit_pivot, gamma_flip_level, max_pain) if value is not None),
+            None,
+        )
+        event_payload = symbol_event_payload or global_event_payload
+        return {
+            "source": "redis_live",
+            "net_gex": _payload_float(gex_payload, "netGex", "net_gex"),
+            "gamma_flip": gamma_flip,
+            "gamma_flip_exact": gamma_flip_exact,
+            "hybrid_gamma_flip": hybrid_gamma_flip,
+            "structural_pivot": structural_pivot,
+            "call_wall": call_wall,
+            "put_wall": put_wall,
+            "max_pain_strike": max_pain,
+            "wall_confidence": _payload_float(gex_payload, "wallConfidence", "wall_confidence"),
+            "pinning_score": _payload_float(gex_payload, "pinningScore", "pinning_score"),
+            "acceleration_risk_score": _payload_float(gex_payload, "accelerationRiskScore", "acceleration_risk_score"),
+            "event_risk": _payload_value(event_payload, "event_risk", "eventRisk") or "unknown",
+            "underlying_mid": spot,
+            "equity_vwap": equity_vwap,
+            "distance_to_vwap_pct": _payload_float(equity_payload, "distanceToVwapPct", "distance_to_vwap_pct") or _signed_distance_pct((spot - equity_vwap) if spot is not None and equity_vwap is not None else None, equity_vwap),
+            "distance_to_call_wall_pct": _signed_distance_pct((call_wall - spot) if spot is not None and call_wall is not None else None, spot),
+            "distance_to_put_wall_pct": _signed_distance_pct((spot - put_wall) if spot is not None and put_wall is not None else None, spot),
+            "distance_to_gamma_flip_pct": _signed_distance_pct((spot - gamma_flip_level) if spot is not None and gamma_flip_level is not None else None, spot),
+            "feature_status": {
+                "gex": self._context_freshness_status(gex_payload, reference_time, "net_gex") if gex_payload else "missing",
+                "equity": _event_freshness_status(equity_payload, reference_time, "underlying_mid") if equity_payload else "missing",
+                "event_risk": "available" if event_payload else "missing",
+            },
+        }
+
     async def _context_float(self, key: str, field: str, default: float) -> float:
         value, _, _ = await self._context_float_with_status(key, field, default)
         return value
@@ -2656,6 +2864,10 @@ class SigmatiqNexus:
             "source": "sigmatiq_nexus",
             "gates": gates,
         }
+        strategy_read = self._build_strategy_read(strategy, "BLOCKED", None, "live_feature_quality_gate_closed", feature_failures=failures)
+        msg.update(strategy_read)
+        msg["strategy_read"] = strategy_read
+        msg["structural_context"] = await self.get_structural_context(symbol, slot.get("window_end_utc") if isinstance(slot, dict) else None)
         msg.update(narratives.build_lifecycle_reason_summary(msg))
         self._log(
             "strategy_blocked",
@@ -2723,6 +2935,9 @@ class SigmatiqNexus:
         if feature_failures:
             msg["feature_failures"] = feature_failures
             msg["missing_features"] = sorted(feature_failures.keys())
+        strategy_read = self._build_strategy_read(strategy, decision, sentiment, reason, feature_failures=feature_failures)
+        msg.update(strategy_read)
+        msg["strategy_read"] = strategy_read
         redis_key = f"nexus_strategy_audit:{symbol}:{strategy}:{slot['entry_label']}"
         payload = json.dumps(msg)
         await self.redis.set(redis_key, payload)
@@ -2780,6 +2995,9 @@ class SigmatiqNexus:
         msg["gates"] = gates
         if sentiment is not None:
             msg["sentiment"] = sentiment
+        strategy_read = self._build_strategy_read(strategy, decision, sentiment, reason)
+        msg.update(strategy_read)
+        msg["strategy_read"] = strategy_read
         lead_contract = self._window_lead_contract(getattr(self, "_current_window_df", pl.DataFrame()))
         pricing_summary = getattr(self, "_current_window_pricing_summary", {}) or {}
         profiles = pricing_summary.get("profiles") or []
@@ -2792,6 +3010,7 @@ class SigmatiqNexus:
         msg["lead_contract_cheapness_score"] = lead_pricing["cheapness_score"] if lead_pricing else None
         if evidence:
             msg.update(evidence)
+        msg["structural_context"] = await self.get_structural_context(symbol, self._window_reference_time(getattr(self, "_current_window_df", pl.DataFrame())))
         msg.update(narratives.build_window_view_narrative(msg))
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
@@ -2802,6 +3021,25 @@ class SigmatiqNexus:
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
         self._log("strategy_window_view_published", strategy=strategy, symbol=symbol, decision=decision, sentiment=sentiment, reason=reason, session_date=str(session_date), entry_time=slot["entry_label"])
+
+    def _build_strategy_read(
+        self,
+        strategy: str,
+        decision: str | None,
+        sentiment: str | None,
+        reason: str | None,
+        *,
+        confidence: float | None = None,
+        feature_failures: dict[str, str] | None = None,
+    ) -> dict:
+        return classify_strategy_read(
+            strategy,
+            decision,
+            sentiment,
+            reason,
+            confidence=confidence,
+            feature_failures=feature_failures,
+        )
 
     async def publish_window_pricing(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:
         key = (str(session_date), symbol, slot["entry_label"])
@@ -2933,6 +3171,772 @@ class SigmatiqNexus:
             directional_read=msg.get("window_side_read", {}).get("directional_read"),
             data_quality=msg.get("data_quality", {}).get("status"),
         )
+
+    async def publish_regime_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "regime_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        iv_rank, _, _, context_status = await self.get_context_with_quality(symbol, reference_time)
+        inputs["iv_rank_pct"] = iv_rank if context_status.get("iv_rank") != "missing" else None
+        regime = classify_regime(inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_regime_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "regime": regime["regime"],
+            "confidence": regime["confidence"],
+            "maturity": regime["maturity"],
+            "reason_codes": regime["reason_codes"],
+            "invalidations": regime["invalidations"],
+            "inputs": inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_regime_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_regime_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "regime_timeline"),
+            slot["entry_label"],
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:regime_timeline", json.dumps(msg))
+        reported.add(key)
+        self.regime_timeline_reported = reported
+        self._log(
+            "regime_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            regime=regime["regime"],
+            confidence=regime["confidence"],
+        )
+
+    async def publish_volatility_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "volatility_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        iv_rank, atm_iv, _, context_status = await self.get_context_with_quality(symbol, reference_time)
+        inputs["iv_rank_pct"] = iv_rank if context_status.get("iv_rank") != "missing" else None
+        inputs["atm_iv"] = atm_iv if context_status.get("atm_iv") != "missing" else None
+        volatility = classify_volatility(inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_volatility_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "volatility_label": volatility["volatility_label"],
+            "confidence": volatility["confidence"],
+            "maturity": volatility["maturity"],
+            "reason_codes": volatility["reason_codes"],
+            "strategy_implications": volatility["strategy_implications"],
+            "inputs": inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_volatility_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_volatility_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "volatility_timeline"),
+            slot["entry_label"],
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:volatility_timeline", json.dumps(msg))
+        reported.add(key)
+        self.volatility_timeline_reported = reported
+        self._log(
+            "volatility_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            volatility_label=volatility["volatility_label"],
+            confidence=volatility["confidence"],
+        )
+
+    async def publish_flow_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "flow_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        regime = classify_regime(inputs)
+        inputs["regime"] = regime["regime"]
+        flow = classify_flow(inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_flow_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "flow_label": flow["flow_label"],
+            "confidence": flow["confidence"],
+            "maturity": flow["maturity"],
+            "reason_codes": flow["reason_codes"],
+            "strategy_implications": flow["strategy_implications"],
+            "inputs": inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_flow_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_flow_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "flow_timeline"),
+            slot["entry_label"],
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:flow_timeline", json.dumps(msg))
+        reported.add(key)
+        self.flow_timeline_reported = reported
+        self._log(
+            "flow_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            flow_label=flow["flow_label"],
+            confidence=flow["confidence"],
+        )
+
+    async def publish_price_location_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "price_location_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        location = classify_price_location(inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_price_location_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "price_location_label": location["price_location_label"],
+            "confidence": location["confidence"],
+            "maturity": location["maturity"],
+            "reason_codes": location["reason_codes"],
+            "strategy_implications": location["strategy_implications"],
+            "inputs": inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_price_location_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_price_location_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "price_location_timeline"),
+            slot["entry_label"],
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:price_location_timeline", json.dumps(msg))
+        reported.add(key)
+        self.price_location_timeline_reported = reported
+        self._log(
+            "price_location_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            price_location_label=location["price_location_label"],
+            confidence=location["confidence"],
+        )
+
+    async def publish_trade_quality_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "trade_quality_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        iv_rank, atm_iv, _, context_status = await self.get_context_with_quality(symbol, reference_time)
+        inputs["iv_rank_pct"] = iv_rank if context_status.get("iv_rank") != "missing" else None
+        inputs["atm_iv"] = atm_iv if context_status.get("atm_iv") != "missing" else None
+        regime = classify_regime(inputs)
+        volatility = classify_volatility(inputs)
+        flow_inputs = {**inputs, "regime_label": regime["regime"]}
+        flow = classify_flow(flow_inputs)
+        location = classify_price_location(inputs)
+        quality_inputs = {
+            **inputs,
+            "regime_label": regime["regime"],
+            "volatility_label": volatility["volatility_label"],
+            "flow_label": flow["flow_label"],
+            "price_location_label": location["price_location_label"],
+        }
+        quality = classify_trade_quality(quality_inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_trade_quality_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "trade_quality_label": quality["trade_quality_label"],
+            "confidence": quality["confidence"],
+            "maturity": quality["maturity"],
+            "reason_codes": quality["reason_codes"],
+            "strategy_implications": quality["strategy_implications"],
+            "component_reads": {
+                "regime": regime["regime"],
+                "volatility_label": volatility["volatility_label"],
+                "flow_label": flow["flow_label"],
+                "price_location_label": location["price_location_label"],
+            },
+            "inputs": quality_inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_trade_quality_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_trade_quality_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "trade_quality_timeline"),
+            slot["entry_label"],
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:trade_quality_timeline", json.dumps(msg))
+        reported.add(key)
+        self.trade_quality_timeline_reported = reported
+        self._log(
+            "trade_quality_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            trade_quality_label=quality["trade_quality_label"],
+            confidence=quality["confidence"],
+        )
+
+    async def publish_invalidation_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "invalidation_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        iv_rank, atm_iv, _, context_status = await self.get_context_with_quality(symbol, reference_time)
+        inputs["iv_rank_pct"] = iv_rank if context_status.get("iv_rank") != "missing" else None
+        inputs["atm_iv"] = atm_iv if context_status.get("atm_iv") != "missing" else None
+        regime = classify_regime(inputs)
+        volatility = classify_volatility(inputs)
+        flow_inputs = {**inputs, "regime_label": regime["regime"]}
+        flow = classify_flow(flow_inputs)
+        location = classify_price_location(inputs)
+        quality_inputs = {
+            **inputs,
+            "regime_label": regime["regime"],
+            "volatility_label": volatility["volatility_label"],
+            "flow_label": flow["flow_label"],
+            "price_location_label": location["price_location_label"],
+        }
+        quality = classify_trade_quality(quality_inputs)
+        invalidation_inputs = {**quality_inputs, "trade_quality_label": quality["trade_quality_label"]}
+        invalidation = classify_invalidation(invalidation_inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_invalidation_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "invalidation_label": invalidation["invalidation_label"],
+            "confidence": invalidation["confidence"],
+            "maturity": invalidation["maturity"],
+            "reason_codes": invalidation["reason_codes"],
+            "strategy_implications": invalidation["strategy_implications"],
+            "component_reads": {
+                "regime": regime["regime"],
+                "volatility_label": volatility["volatility_label"],
+                "flow_label": flow["flow_label"],
+                "price_location_label": location["price_location_label"],
+                "trade_quality_label": quality["trade_quality_label"],
+            },
+            "inputs": invalidation_inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_invalidation_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_invalidation_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "invalidation_timeline"),
+            slot["entry_label"],
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:invalidation_timeline", json.dumps(msg))
+        reported.add(key)
+        self.invalidation_timeline_reported = reported
+        self._log(
+            "invalidation_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            invalidation_label=invalidation["invalidation_label"],
+            confidence=invalidation["confidence"],
+        )
+
+    async def publish_timing_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "timing_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        iv_rank, atm_iv, _, context_status = await self.get_context_with_quality(symbol, reference_time)
+        inputs["iv_rank_pct"] = iv_rank if context_status.get("iv_rank") != "missing" else None
+        inputs["atm_iv"] = atm_iv if context_status.get("atm_iv") != "missing" else None
+        regime = classify_regime(inputs)
+        volatility = classify_volatility(inputs)
+        flow_inputs = {**inputs, "regime_label": regime["regime"]}
+        flow = classify_flow(flow_inputs)
+        location = classify_price_location(inputs)
+        quality_inputs = {
+            **inputs,
+            "regime_label": regime["regime"],
+            "volatility_label": volatility["volatility_label"],
+            "flow_label": flow["flow_label"],
+            "price_location_label": location["price_location_label"],
+        }
+        quality = classify_trade_quality(quality_inputs)
+        invalidation_inputs = {**quality_inputs, "trade_quality_label": quality["trade_quality_label"]}
+        invalidation = classify_invalidation(invalidation_inputs)
+        timing_inputs = {**invalidation_inputs, "invalidation_label": invalidation["invalidation_label"]}
+        timing = classify_timing(timing_inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_timing_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "timing_label": timing["timing_label"],
+            "confidence": timing["confidence"],
+            "maturity": timing["maturity"],
+            "reason_codes": timing["reason_codes"],
+            "strategy_implications": timing["strategy_implications"],
+            "component_reads": {
+                "regime": regime["regime"],
+                "volatility_label": volatility["volatility_label"],
+                "flow_label": flow["flow_label"],
+                "price_location_label": location["price_location_label"],
+                "trade_quality_label": quality["trade_quality_label"],
+                "invalidation_label": invalidation["invalidation_label"],
+            },
+            "inputs": timing_inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_timing_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_timing_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "timing_timeline"),
+            slot["entry_label"],
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:timing_timeline", json.dumps(msg))
+        reported.add(key)
+        self.timing_timeline_reported = reported
+        self._log(
+            "timing_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            timing_label=timing["timing_label"],
+            confidence=timing["confidence"],
+        )
+
+    async def publish_liquidity_execution_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "liquidity_execution_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        execution = classify_liquidity_execution(inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_liquidity_execution_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "liquidity_execution_label": execution["liquidity_execution_label"],
+            "confidence": execution["confidence"],
+            "maturity": execution["maturity"],
+            "reason_codes": execution["reason_codes"],
+            "strategy_implications": execution["strategy_implications"],
+            "inputs": inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_liquidity_execution_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_liquidity_execution_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(nexus_index_key(session_date, symbol, "liquidity_execution_timeline"), slot["entry_label"])
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:liquidity_execution_timeline", json.dumps(msg))
+        reported.add(key)
+        self.liquidity_execution_timeline_reported = reported
+        self._log(
+            "liquidity_execution_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            liquidity_execution_label=execution["liquidity_execution_label"],
+            confidence=execution["confidence"],
+        )
+
+    async def publish_event_reliability_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "event_reliability_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        reliability = classify_event_reliability(inputs)
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_event_reliability_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "event_reliability_label": reliability["event_reliability_label"],
+            "confidence": reliability["confidence"],
+            "maturity": reliability["maturity"],
+            "reason_codes": reliability["reason_codes"],
+            "strategy_implications": reliability["strategy_implications"],
+            "inputs": inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_event_reliability_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_event_reliability_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(nexus_index_key(session_date, symbol, "event_reliability_timeline"), slot["entry_label"])
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:event_reliability_timeline", json.dumps(msg))
+        reported.add(key)
+        self.event_reliability_timeline_reported = reported
+        self._log(
+            "event_reliability_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            event_reliability_label=reliability["event_reliability_label"],
+            confidence=reliability["confidence"],
+        )
+
+    async def publish_position_management_timeline_for_slot(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "position_management_timeline_reported", set())
+        if key in reported:
+            return
+        df = await self._window_df_for_symbol(symbol, slot, session_date, reference_time)
+        structural_context = await self.get_structural_context(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df) if not df.is_empty() else {}
+        inputs = self._regime_inputs(df, symbol, slot, structural_context, pricing_summary)
+        inputs.update(self._regime_session_metrics(symbol, slot, session_date, structural_context))
+        iv_rank, atm_iv, _, context_status = await self.get_context_with_quality(symbol, reference_time)
+        inputs["iv_rank_pct"] = iv_rank if context_status.get("iv_rank") != "missing" else None
+        inputs["atm_iv"] = atm_iv if context_status.get("atm_iv") != "missing" else None
+        regime = classify_regime(inputs)
+        volatility = classify_volatility(inputs)
+        flow = classify_flow({**inputs, "regime_label": regime["regime"]})
+        location = classify_price_location(inputs)
+        quality_inputs = {
+            **inputs,
+            "regime_label": regime["regime"],
+            "volatility_label": volatility["volatility_label"],
+            "flow_label": flow["flow_label"],
+            "price_location_label": location["price_location_label"],
+        }
+        quality = classify_trade_quality(quality_inputs)
+        invalidation_inputs = {**quality_inputs, "trade_quality_label": quality["trade_quality_label"]}
+        invalidation = classify_invalidation(invalidation_inputs)
+        timing_inputs = {**invalidation_inputs, "invalidation_label": invalidation["invalidation_label"]}
+        timing = classify_timing(timing_inputs)
+        execution = classify_liquidity_execution(inputs)
+        reliability = classify_event_reliability(inputs)
+        management_inputs = {
+            **timing_inputs,
+            "timing_label": timing["timing_label"],
+            "liquidity_execution_label": execution["liquidity_execution_label"],
+            "event_reliability_label": reliability["event_reliability_label"],
+        }
+        management = classify_position_management(management_inputs)
+        component_reads = {
+            "regime": regime["regime"],
+            "volatility_label": volatility["volatility_label"],
+            "flow_label": flow["flow_label"],
+            "price_location_label": location["price_location_label"],
+            "trade_quality_label": quality["trade_quality_label"],
+            "invalidation_label": invalidation["invalidation_label"],
+            "timing_label": timing["timing_label"],
+            "liquidity_execution_label": execution["liquidity_execution_label"],
+            "event_reliability_label": reliability["event_reliability_label"],
+        }
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_position_management_timeline",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "window_label": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+            "position_management_label": management["position_management_label"],
+            "confidence": management["confidence"],
+            "maturity": management["maturity"],
+            "reason_codes": management["reason_codes"],
+            "strategy_implications": management["strategy_implications"],
+            "component_reads": component_reads,
+            "inputs": management_inputs,
+            "structural_context": structural_context,
+        }
+        redis_key = f"nexus_position_management_timeline:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_position_management_timeline:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(nexus_index_key(session_date, symbol, "position_management_timeline"), slot["entry_label"])
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:position_management_timeline", json.dumps(msg))
+        reported.add(key)
+        self.position_management_timeline_reported = reported
+        self._log(
+            "position_management_timeline_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_label=slot["entry_label"],
+            position_management_label=management["position_management_label"],
+            confidence=management["confidence"],
+        )
+
+    def _regime_inputs(self, df: pl.DataFrame, symbol: str, slot: dict, structural_context: dict, pricing_summary: dict | None = None) -> dict:
+        stats = window_stats(df) if not df.is_empty() else {"call_p": 0.0, "put_p": 0.0, "total_p": 0.0}
+        sweep_ratio = float(stats.get("sweep") or 0.0)
+        flow = self._window_flow_aggressor_stats(df)
+        pricing_summary = pricing_summary or {}
+        equity_first = None
+        equity_last = structural_context.get("underlying_mid")
+        if not df.is_empty() and "underlying_mid" in df.columns:
+            values = [
+                row.get("underlying_mid")
+                for row in df.sort("ts_utc").to_dicts()
+                if row.get("underlying_mid") not in (None, "")
+            ]
+            if values:
+                equity_first = float(values[0])
+                equity_last = float(values[-1])
+        equity_return_pct = None
+        if equity_first and equity_last:
+            equity_return_pct = ((float(equity_last) - float(equity_first)) / float(equity_first)) * 100.0
+        max_quote_age_ms = None
+        worst_tradability_bucket = None
+        if not df.is_empty() and "quote_age_ms" in df.columns:
+            ages = [row.get("quote_age_ms") for row in df.to_dicts() if row.get("quote_age_ms") not in (None, "")]
+            if ages:
+                max_quote_age_ms = max(float(age) for age in ages)
+        if not df.is_empty() and "tradability_bucket" in df.columns:
+            bucket_priority = {
+                "untradable": 8,
+                "blocked": 7,
+                "poor": 6,
+                "thin": 5,
+                "wide": 4,
+                "degraded": 3,
+                "fair": 2,
+                "good": 1,
+            }
+            buckets = [
+                str(row.get("tradability_bucket") or "").strip().lower()
+                for row in df.to_dicts()
+                if row.get("tradability_bucket") not in (None, "")
+            ]
+            if buckets:
+                worst_tradability_bucket = max(buckets, key=lambda bucket: bucket_priority.get(bucket, 0))
+        return {
+            "symbol": symbol,
+            "window_label": slot["entry_label"],
+            "call_premium": float(stats["call_p"]),
+            "put_premium": float(stats["put_p"]),
+            "total_premium": float(stats["total_p"]),
+            "sweep_ratio": sweep_ratio,
+            "sweep_quality_status": "ready" if not df.is_empty() and "is_sweep" in df.columns else "unknown",
+            "ask_aggressor_premium": flow["ask_aggressor_premium"],
+            "bid_aggressor_premium": flow["bid_aggressor_premium"],
+            "aggressor_quality_status": flow["aggressor_quality_status"],
+            "equity_first_price": equity_first,
+            "equity_last_price": equity_last,
+            "equity_return_pct": equity_return_pct,
+            "pricing_quality": pricing_summary.get("pricing_quality") or "unknown",
+            "max_quote_age_ms": max_quote_age_ms,
+            "worst_tradability_bucket": worst_tradability_bucket,
+            "iv_rank_pct": None,
+            "net_gex": structural_context.get("net_gex"),
+            "event_risk": structural_context.get("event_risk"),
+            "equity_vwap": structural_context.get("equity_vwap"),
+            "distance_to_vwap_pct": structural_context.get("distance_to_vwap_pct"),
+            "gamma_flip": structural_context.get("gamma_flip"),
+            "gamma_flip_exact": structural_context.get("gamma_flip_exact"),
+            "hybrid_gamma_flip": structural_context.get("hybrid_gamma_flip"),
+            "structural_pivot": structural_context.get("structural_pivot"),
+            "call_wall": structural_context.get("call_wall"),
+            "put_wall": structural_context.get("put_wall"),
+            "max_pain_strike": structural_context.get("max_pain_strike"),
+            "wall_confidence": structural_context.get("wall_confidence"),
+            "pinning_score": structural_context.get("pinning_score"),
+            "acceleration_risk_score": structural_context.get("acceleration_risk_score"),
+            "distance_to_call_wall_pct": structural_context.get("distance_to_call_wall_pct"),
+            "distance_to_put_wall_pct": structural_context.get("distance_to_put_wall_pct"),
+            "distance_to_gamma_flip_pct": structural_context.get("distance_to_gamma_flip_pct"),
+        }
+
+    def _window_flow_aggressor_stats(self, df: pl.DataFrame) -> dict:
+        if df.is_empty() or "aggressor" not in df.columns:
+            return {"ask_aggressor_premium": 0.0, "bid_aggressor_premium": 0.0, "aggressor_quality_status": "unknown"}
+        rows = df.to_dicts()
+        ask = 0.0
+        bid = 0.0
+        classified = 0
+        for row in rows:
+            premium = float(row.get("premium") or 0.0)
+            aggressor = str(row.get("aggressor") or "").strip().upper()
+            if aggressor == "A":
+                ask += premium
+                classified += 1
+            elif aggressor == "B":
+                bid += premium
+                classified += 1
+        return {
+            "ask_aggressor_premium": ask,
+            "bid_aggressor_premium": bid,
+            "aggressor_quality_status": "ready" if classified > 0 else "unknown",
+        }
+
+    def _regime_session_metrics(self, symbol: str, slot: dict, session_date, structural_context: dict) -> dict:
+        df = window_df_for_slot(pl.DataFrame(list(self.buffers.get(symbol, []))), {"window_start": time(9, 30), "window_end": slot["window_end"], "entry_label": "session"}, session_date)
+        if df.is_empty() or "underlying_mid" not in df.columns:
+            return {
+                "session_open_price": None,
+                "session_return_pct": None,
+                "consecutive_trend_windows": 0,
+                "failed_wall_acceptance": False,
+            }
+        rows = [
+            row
+            for row in df.sort("ts_utc").to_dicts()
+            if row.get("underlying_mid") not in (None, "")
+        ]
+        if not rows:
+            return {
+                "session_open_price": None,
+                "session_return_pct": None,
+                "consecutive_trend_windows": 0,
+                "failed_wall_acceptance": False,
+            }
+        session_open = float(rows[0]["underlying_mid"])
+        session_last = float(rows[-1]["underlying_mid"])
+        session_return_pct = ((session_last - session_open) / session_open) * 100.0 if session_open > 0 else None
+        directions = []
+        for context_slot in MARKET_CONTEXT_WINDOWS:
+            if context_slot["window_end"] > slot["window_end"]:
+                break
+            window_df = window_df_for_slot(df, context_slot, session_date)
+            values = [
+                row.get("underlying_mid")
+                for row in window_df.sort("ts_utc").to_dicts()
+                if row.get("underlying_mid") not in (None, "")
+            ]
+            if len(values) < 2:
+                continue
+            first = float(values[0])
+            last = float(values[-1])
+            window_return = ((last - first) / first) * 100.0 if first > 0 else 0.0
+            if window_return >= 0.05:
+                directions.append("up")
+            elif window_return <= -0.05:
+                directions.append("down")
+            else:
+                directions.append("flat")
+        latest_direction = next((d for d in reversed(directions) if d != "flat"), None)
+        consecutive = 0
+        if latest_direction:
+            for direction in reversed(directions):
+                if direction == latest_direction:
+                    consecutive += 1
+                elif direction != "flat":
+                    break
+        call_wall = structural_context.get("call_wall")
+        put_wall = structural_context.get("put_wall")
+        highs = [float(row["underlying_mid"]) for row in rows]
+        failed_call = call_wall is not None and max(highs) >= float(call_wall) and session_last < float(call_wall)
+        failed_put = put_wall is not None and min(highs) <= float(put_wall) and session_last > float(put_wall)
+        return {
+            "session_open_price": session_open,
+            "session_return_pct": session_return_pct,
+            "consecutive_trend_windows": consecutive,
+            "failed_wall_acceptance": failed_call or failed_put,
+        }
 
     async def publish_window_assessments(self, df: pl.DataFrame, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
         self._current_window_df = df
@@ -3425,10 +4429,15 @@ class SigmatiqNexus:
         }
         if raw_symbol:
             msg["raw_symbol"] = raw_symbol
+            msg["trade_expression"] = _safe_trade_expression(raw_symbol)
         if slot:
             msg.update({"entry_time": slot["entry_label"], "window_start": slot["window_start"].isoformat(), "window_end": slot["window_end"].isoformat()})
         if session_date:
             msg["session_date"] = str(session_date)
+        strategy_read = self._build_strategy_read(strategy, "INTERMEDIATE", sentiment, "strategy_candidate_detected", confidence=confidence)
+        msg.update(strategy_read)
+        msg["strategy_read"] = strategy_read
+        msg["structural_context"] = await self.get_structural_context(symbol)
         msg.update(narratives.build_lifecycle_reason_summary(msg))
         entry_label = slot["entry_label"] if slot else "na"
         redis_key = f"nexus_intermediate:{symbol}:{strategy}:{entry_label}"
@@ -3548,11 +4557,18 @@ class SigmatiqNexus:
             msg.update({"entry_time": slot["entry_label"], "window_start": slot["window_start"].isoformat(), "window_end": slot["window_end"].isoformat()})
         if raw_symbol:
             msg["raw_symbol"] = raw_symbol
+            contract_details = _contract_details_from_raw_symbol(raw_symbol)
             msg.update({k: v for k, v in {
-                "expiry_date": _contract_details_from_raw_symbol(raw_symbol)["expiry_date"],
-                "strike": _contract_details_from_raw_symbol(raw_symbol)["strike"],
-                "option_side": _contract_details_from_raw_symbol(raw_symbol)["side"],
+                "expiry_date": contract_details["expiry_date"],
+                "strike": contract_details["strike"],
+                "option_side": contract_details["side"],
             }.items() if v is not None})
+            msg["trade_expression"] = _safe_trade_expression(raw_symbol)
+        msg["risk_guidance"] = _risk_guidance_from_price(entry_price)
+        strategy_read = self._build_strategy_read(strategy, "BET", sentiment, "candidate_promoted_to_bet", confidence=confidence)
+        msg.update(strategy_read)
+        msg["strategy_read"] = strategy_read
+        msg["structural_context"] = await self.get_structural_context(symbol)
         msg.update(narratives.build_lifecycle_reason_summary(msg))
         # Track position for dynamic exit
         active_positions = getattr(self, "active_positions", None)
@@ -3614,6 +4630,16 @@ class SigmatiqNexus:
                     "tradability_bucket": quote.get("tradability_bucket"),
                 },
             })
+        safe_legs = [
+            {
+                "action": leg["action"],
+                "ratio": leg["ratio"],
+                "option_type": "CALL" if leg["side"] == "C" else "PUT" if leg["side"] == "P" else leg["side"],
+                "strike": leg["strike"],
+                "expiry": leg["expiry_date"],
+            }
+            for leg in candidate["legs"]
+        ]
         if quote_freshness not in FRESH_STATUSES:
             await self._publish_final_block(
                 strategy,
@@ -3650,6 +4676,13 @@ class SigmatiqNexus:
             "entry_credit": candidate["net_credit"],
             "entry_price": candidate["net_credit"],
             "entry_price_reference": "net_credit",
+            "trade_expression": {
+                "structure": candidate["structure"],
+                "spread_type": candidate["spread_type"],
+                "expiry": candidate["expiry_date"],
+                "legs": safe_legs,
+            },
+            "risk_guidance": _risk_guidance_from_price(candidate["net_credit"], side="credit"),
             "quote_freshness": quote_freshness,
             "quote_valid_until": quote_valid_until,
             "spread": {
@@ -3695,6 +4728,9 @@ class SigmatiqNexus:
             "window_end": slot["window_end"].isoformat(),
             "source": "sigmatiq_nexus",
         }
+        strategy_read = self._build_strategy_read(strategy, "BET", sentiment, "candidate_promoted_to_bet", confidence=confidence)
+        msg.update(strategy_read)
+        msg["strategy_read"] = strategy_read
         msg.update(narratives.build_lifecycle_reason_summary(msg))
         redis_key = f"nexus_spread_overlay:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
@@ -3752,6 +4788,9 @@ class SigmatiqNexus:
                 "window_start": slot["window_start"].isoformat(),
                 "window_end": slot["window_end"].isoformat(),
             })
+        strategy_read = self._build_strategy_read(strategy, "FINAL_BLOCKED", sentiment, reason, confidence=confidence)
+        msg.update(strategy_read)
+        msg["strategy_read"] = strategy_read
         msg.update(narratives.build_lifecycle_reason_summary(msg))
         redis_key = f"nexus_final_block:{symbol}:{strategy}:{entry_label}"
         await self.redis.set(redis_key, json.dumps(msg), ex=NEXUS_INDEX_TTL_SECONDS)

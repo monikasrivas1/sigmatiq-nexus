@@ -686,12 +686,92 @@ payloads AS (
             'decision', 'INTERMEDIATE',
             'sentiment', e.sentiment,
             'confidence', e.confidence,
+            'strategy_read_label', CASE e.strategy_key
+                WHEN 'etf_confluence_sniper' THEN 'confluence_alignment_candidate'
+                WHEN 'etf_open_specialist' THEN 'opening_drive_candidate'
+                WHEN 'etf_low_sweep_core' THEN 'clean_directional_flow_candidate'
+                WHEN 'etf_flow_specialist' THEN 'flow_confirmation_candidate'
+                WHEN 'etf_momentum_specialist' THEN 'momentum_continuation_candidate'
+                WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit_candidate'
+                WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit_candidate'
+                ELSE 'unknown_strategy_capability_candidate'
+            END,
+            'strategy_action', 'candidate',
+            'strategy_capability', CASE e.strategy_key
+                WHEN 'etf_confluence_sniper' THEN 'confluence_alignment'
+                WHEN 'etf_open_specialist' THEN 'opening_drive'
+                WHEN 'etf_low_sweep_core' THEN 'clean_directional_flow'
+                WHEN 'etf_flow_specialist' THEN 'flow_confirmation'
+                WHEN 'etf_momentum_specialist' THEN 'momentum_continuation'
+                WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit'
+                WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit'
+                ELSE 'unknown_strategy_capability'
+            END,
+            'strategy_vehicle', CASE e.strategy_key
+                WHEN 'etf_put_credit_open30_spread' THEN 'put_credit_spread'
+                WHEN 'etf_call_credit_open30_spread' THEN 'call_credit_spread'
+                WHEN 'etf_open_specialist' THEN 'long_call_or_call_debit'
+                ELSE 'long_option_or_debit_spread'
+            END,
+            'strategy_direction', CASE WHEN e.sentiment = 'BULLISH' THEN 'bullish' WHEN e.sentiment = 'BEARISH' THEN 'bearish' ELSE 'neutral' END,
+            'strategy_read', jsonb_build_object(
+                'strategy_read_label', CASE e.strategy_key
+                    WHEN 'etf_confluence_sniper' THEN 'confluence_alignment_candidate'
+                    WHEN 'etf_open_specialist' THEN 'opening_drive_candidate'
+                    WHEN 'etf_low_sweep_core' THEN 'clean_directional_flow_candidate'
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation_candidate'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation_candidate'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit_candidate'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit_candidate'
+                    ELSE 'unknown_strategy_capability_candidate'
+                END,
+                'strategy_action', 'candidate',
+                'strategy_capability', CASE e.strategy_key
+                    WHEN 'etf_confluence_sniper' THEN 'confluence_alignment'
+                    WHEN 'etf_open_specialist' THEN 'opening_drive'
+                    WHEN 'etf_low_sweep_core' THEN 'clean_directional_flow'
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit'
+                    ELSE 'unknown_strategy_capability'
+                END,
+                'strategy_vehicle', CASE e.strategy_key
+                    WHEN 'etf_put_credit_open30_spread' THEN 'put_credit_spread'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'call_credit_spread'
+                    WHEN 'etf_open_specialist' THEN 'long_call_or_call_debit'
+                    ELSE 'long_option_or_debit_spread'
+                END,
+                'strategy_direction', CASE WHEN e.sentiment = 'BULLISH' THEN 'bullish' WHEN e.sentiment = 'BEARISH' THEN 'bearish' ELSE 'neutral' END,
+                'strategy_confidence', e.confidence,
+                'strategy_blockers', '[]'::jsonb,
+                'strategy_reason_codes', jsonb_build_array(e.replay_reason, 'strategy_candidate_detected')
+            ),
             'timestamp', now(),
             'source', {source},
             'session_date', e.session_date::text,
             'entry_time', e.entry_time,
             'window_start', e.window_start_utc,
             'window_end', e.window_end_utc,
+            'trade_expression', jsonb_build_object(
+                'option_type', CASE WHEN e.lead_option_side = 'C' THEN 'CALL' WHEN e.lead_option_side = 'P' THEN 'PUT' ELSE NULL END,
+                'expiry', CASE
+                    WHEN substring(replace(e.lead_contract_raw_symbol, ' ', '') from '([0-9]{{6}})[CP][0-9]{{8}}$') IS NOT NULL
+                    THEN '20' || substring(replace(e.lead_contract_raw_symbol, ' ', '') from '([0-9]{{2}})[0-9]{{4}}[CP][0-9]{{8}}$')
+                        || '-' || substring(replace(e.lead_contract_raw_symbol, ' ', '') from '[0-9]{{2}}([0-9]{{2}})[0-9]{{2}}[CP][0-9]{{8}}$')
+                        || '-' || substring(replace(e.lead_contract_raw_symbol, ' ', '') from '[0-9]{{4}}([0-9]{{2}})[CP][0-9]{{8}}$')
+                    ELSE NULL
+                END,
+                'strike', (substring(replace(e.lead_contract_raw_symbol, ' ', '') from '[CP]([0-9]{{8}})$')::numeric / 1000.0)
+            ),
+            'risk_guidance', jsonb_build_object(
+                'order_type', 'limit',
+                'price_reference', 'derived_from_live_contract_quote',
+                'limit_tolerance_pct', 1.0,
+                'max_debit', ceil((e.lead_quote_mid * 1.01) * 100.0) / 100.0,
+                'max_risk_per_contract', (ceil((e.lead_quote_mid * 1.01) * 100.0) / 100.0) * 100.0,
+                'sizing_note', 'Do not pay above $' || to_char(ceil((e.lead_quote_mid * 1.01) * 100.0) / 100.0, 'FM999999990.00') || '.'
+            ),
             'raw_symbol', e.lead_contract_raw_symbol,
             'entry_quote', jsonb_build_object(
                 'option_mid', e.lead_quote_mid,
@@ -732,6 +812,27 @@ payloads AS (
                 'equity_last_price', e.equity_last_price,
                 'cheap_side', e.cheap_side,
                 'pricing_quality', e.pricing_quality,
+                'strategy_read_label', CASE e.strategy_key
+                    WHEN 'etf_confluence_sniper' THEN 'confluence_alignment_candidate'
+                    WHEN 'etf_open_specialist' THEN 'opening_drive_candidate'
+                    WHEN 'etf_low_sweep_core' THEN 'clean_directional_flow_candidate'
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation_candidate'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation_candidate'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit_candidate'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit_candidate'
+                    ELSE 'unknown_strategy_capability_candidate'
+                END,
+                'strategy_action', 'candidate',
+                'strategy_capability', CASE e.strategy_key
+                    WHEN 'etf_confluence_sniper' THEN 'confluence_alignment'
+                    WHEN 'etf_open_specialist' THEN 'opening_drive'
+                    WHEN 'etf_low_sweep_core' THEN 'clean_directional_flow'
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit'
+                    ELSE 'unknown_strategy_capability'
+                END,
                 'model_status', CASE WHEN e.strategy_key IN ('etf_flow_specialist', 'etf_momentum_specialist') THEN 'not_run_db_replay_intermediate_only' ELSE 'not_required' END,
                 'spread_status', CASE WHEN e.strategy_key IN ('etf_put_credit_open30_spread', 'etf_call_credit_open30_spread') THEN 'not_constructed_db_replay_intermediate_only' ELSE 'not_applicable' END,
                 'replay_scope', CASE
@@ -1183,12 +1284,78 @@ payloads AS (
             'decision', 'WATCH',
             'sentiment', rw.sentiment,
             'confidence', rw.confidence,
+            'strategy_read_label', CASE rw.strategy_key
+                WHEN 'etf_flow_specialist' THEN 'flow_confirmation_watch'
+                WHEN 'etf_momentum_specialist' THEN 'momentum_continuation_watch'
+                WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit_watch'
+                WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit_watch'
+                ELSE 'unknown_strategy_capability_watch'
+            END,
+            'strategy_action', 'watch',
+            'strategy_capability', CASE rw.strategy_key
+                WHEN 'etf_flow_specialist' THEN 'flow_confirmation'
+                WHEN 'etf_momentum_specialist' THEN 'momentum_continuation'
+                WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit'
+                WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit'
+                ELSE 'unknown_strategy_capability'
+            END,
+            'strategy_vehicle', CASE rw.strategy_key
+                WHEN 'etf_put_credit_open30_spread' THEN 'put_credit_spread'
+                WHEN 'etf_call_credit_open30_spread' THEN 'call_credit_spread'
+                ELSE 'long_option_or_debit_spread'
+            END,
+            'strategy_direction', CASE WHEN rw.sentiment = 'BULLISH' THEN 'bullish' WHEN rw.sentiment = 'BEARISH' THEN 'bearish' ELSE 'neutral' END,
+            'strategy_read', jsonb_build_object(
+                'strategy_read_label', CASE rw.strategy_key
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation_watch'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation_watch'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit_watch'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit_watch'
+                    ELSE 'unknown_strategy_capability_watch'
+                END,
+                'strategy_action', 'watch',
+                'strategy_capability', CASE rw.strategy_key
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit'
+                    ELSE 'unknown_strategy_capability'
+                END,
+                'strategy_vehicle', CASE rw.strategy_key
+                    WHEN 'etf_put_credit_open30_spread' THEN 'put_credit_spread'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'call_credit_spread'
+                    ELSE 'long_option_or_debit_spread'
+                END,
+                'strategy_direction', CASE WHEN rw.sentiment = 'BULLISH' THEN 'bullish' WHEN rw.sentiment = 'BEARISH' THEN 'bearish' ELSE 'neutral' END,
+                'strategy_confidence', rw.confidence,
+                'strategy_blockers', jsonb_build_array(rw.failed_gate),
+                'strategy_reason_codes', jsonb_build_array(rw.replay_reason, 'relaxed_gate_watch_only')
+            ),
             'timestamp', now(),
             'source', {source},
             'session_date', rw.session_date::text,
             'entry_time', rw.entry_time,
             'window_start', rw.window_start_utc,
             'window_end', rw.window_end_utc,
+            'trade_expression', jsonb_build_object(
+                'option_type', CASE WHEN rw.lead_option_side = 'C' THEN 'CALL' WHEN rw.lead_option_side = 'P' THEN 'PUT' ELSE NULL END,
+                'expiry', CASE
+                    WHEN substring(replace(rw.lead_contract_raw_symbol, ' ', '') from '([0-9]{{6}})[CP][0-9]{{8}}$') IS NOT NULL
+                    THEN '20' || substring(replace(rw.lead_contract_raw_symbol, ' ', '') from '([0-9]{{2}})[0-9]{{4}}[CP][0-9]{{8}}$')
+                        || '-' || substring(replace(rw.lead_contract_raw_symbol, ' ', '') from '[0-9]{{2}}([0-9]{{2}})[0-9]{{2}}[CP][0-9]{{8}}$')
+                        || '-' || substring(replace(rw.lead_contract_raw_symbol, ' ', '') from '[0-9]{{4}}([0-9]{{2}})[CP][0-9]{{8}}$')
+                    ELSE NULL
+                END,
+                'strike', (substring(replace(rw.lead_contract_raw_symbol, ' ', '') from '[CP]([0-9]{{8}})$')::numeric / 1000.0)
+            ),
+            'risk_guidance', jsonb_build_object(
+                'order_type', 'limit',
+                'price_reference', 'derived_from_live_contract_quote',
+                'limit_tolerance_pct', 1.0,
+                'max_debit', ceil((rw.lead_quote_mid * 1.01) * 100.0) / 100.0,
+                'max_risk_per_contract', (ceil((rw.lead_quote_mid * 1.01) * 100.0) / 100.0) * 100.0,
+                'sizing_note', 'Do not pay above $' || to_char(ceil((rw.lead_quote_mid * 1.01) * 100.0) / 100.0, 'FM999999990.00') || '.'
+            ),
             'raw_symbol', rw.lead_contract_raw_symbol,
             'entry_quote', jsonb_build_object(
                 'option_mid', rw.lead_quote_mid,
@@ -1228,6 +1395,21 @@ payloads AS (
                 'daily_context_status', rw.daily_context_status,
                 'readiness_status', rw.readiness_status,
                 'final_quote_status', rw.final_quote_status,
+                'strategy_read_label', CASE rw.strategy_key
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation_watch'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation_watch'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit_watch'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit_watch'
+                    ELSE 'unknown_strategy_capability_watch'
+                END,
+                'strategy_action', 'watch',
+                'strategy_capability', CASE rw.strategy_key
+                    WHEN 'etf_flow_specialist' THEN 'flow_confirmation'
+                    WHEN 'etf_momentum_specialist' THEN 'momentum_continuation'
+                    WHEN 'etf_put_credit_open30_spread' THEN 'defined_risk_bullish_credit'
+                    WHEN 'etf_call_credit_open30_spread' THEN 'defined_risk_bearish_credit'
+                    ELSE 'unknown_strategy_capability'
+                END,
                 'model_status', CASE WHEN rw.strategy_key IN ('etf_flow_specialist', 'etf_momentum_specialist') THEN 'not_run_db_replay_watch_only' ELSE 'not_required' END,
                 'spread_status', CASE WHEN rw.strategy_key IN ('etf_put_credit_open30_spread', 'etf_call_credit_open30_spread') THEN 'not_constructed_db_replay_watch_only' ELSE 'not_applicable' END
             ),

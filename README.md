@@ -119,6 +119,8 @@ nexus-audit-features --symbol SPY --limit 5
 
 The audit reports which implemented strategies are `ready`, `degraded`, or `blocked` based on the sampled trade event plus live IV/GEX context. It also reports `stale` or `unknown_freshness` when a required field exists but cannot be trusted at decision time. The full feature contract is documented in `docs/NEXUS_LIVE_FEATURE_CONTRACT.md`.
 
+Live Redis Nexus messages now carry `structural_context` from the same primary keys used by strategy readiness: `options:live:gex:{symbol}`, `equity:live:context:{symbol}`, and `config:live:event_risk:{symbol}` / `config:live:event_risk:global`. The context includes gamma flip, call/put wall, max pain, wall confidence, pinning/acceleration risk, event risk, equity VWAP, and distance-to-level fields. Nexus also publishes all-day deterministic timeline feeds for every completed market-context window: `nexus_regime_timeline:{symbol}:{window_label}`, `nexus_volatility_timeline:{symbol}:{window_label}`, `nexus_flow_timeline:{symbol}:{window_label}`, `nexus_price_location_timeline:{symbol}:{window_label}`, `nexus_trade_quality_timeline:{symbol}:{window_label}`, `nexus_invalidation_timeline:{symbol}:{window_label}`, `nexus_timing_timeline:{symbol}:{window_label}`, `nexus_liquidity_execution_timeline:{symbol}:{window_label}`, `nexus_event_reliability_timeline:{symbol}:{window_label}`, and `nexus_position_management_timeline:{symbol}:{window_label}`. The DB replay/materializer path carries the same structural, regime, volatility, flow, price-location, trade-quality, invalidation, timing, liquidity/execution, event-reliability, and position-management fields in `live.prepared_nexus_window_context` for fallback and audit.
+
 ## DB Signal-Potential Audit
 
 After or during a session, use the DB-first signal-potential audit to check whether the persisted raw and materialized live tables could have supported Nexus signals:
@@ -183,7 +185,9 @@ Production runs the polling worker as a separate Azure Container App, `sigmatiq-
 
 At runtime Nexus enriches raw option trade events from:
 
-- `equity:live:context:{symbol}` for `underlying_mid` and spot freshness.
+- `equity:live:context:{symbol}` for `underlying_mid`, equity VWAP, distance to VWAP, and spot freshness.
+- `options:live:gex:{symbol}` for structural context such as gamma flip, call/put walls, max pain, wall confidence, pinning score, and acceleration risk.
+- `config:live:event_risk:{symbol}` / `config:live:event_risk:global` for macro/event risk.
 - `options:live:tradability:{raw_symbol}` for option bid/ask/mid, quote timestamp, spread, and executable/tradability flags.
 - `options:live:contract_state:{raw_symbol}` for option mid, quote quality, tradability flags, underlying spot, and Greeks.
 - If raw trades omit `aggressor` or `is_sweep`, Nexus derives them only from fresh quote state; stale or untradable quotes still block the relevant strategy.

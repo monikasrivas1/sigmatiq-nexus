@@ -86,6 +86,16 @@ def test_emit_sql_uses_idempotent_ledger_before_append_only_signal_insert():
     assert "spread_status" in sql
     assert "not_constructed_db_replay_intermediate_only" in sql
     assert "replay_scope" in sql
+    assert "'strategy_read', jsonb_build_object" in sql
+    assert "'strategy_read_label'" in sql
+    assert "'strategy_action', 'candidate'" in sql
+    assert "'strategy_capability'" in sql
+    assert "'strategy_vehicle'" in sql
+    assert "confluence_alignment_candidate" in sql
+    assert "defined_risk_bullish_credit_candidate" in sql
+    assert "'trade_expression', jsonb_build_object" in sql
+    assert "'risk_guidance', jsonb_build_object" in sql
+    assert "'max_debit', ceil((e.lead_quote_mid * 1.01) * 100.0) / 100.0" in sql
     assert "LIMIT 3" in sql
     assert json.dumps({"IWM": 75_000.0}) in sql
 
@@ -115,6 +125,11 @@ def test_relaxed_watch_sql_is_separate_watch_only_path():
     assert "relaxed_momentum_iv_rank_threshold" in sql
     assert "bw.iv_rank_pct >= 40" in sql
     assert "bw.iv_rank_pct < 45.0::numeric" in sql
+
+    emit_sql = build_relaxed_watch_emit_sql(_config(limit=5))
+
+    assert "'strategy_action', 'watch'" in emit_sql
+    assert "flow_confirmation_watch" in emit_sql
     assert "relaxed_put_credit_spread_iv_rank_threshold" in sql
     assert "relaxed_watch_with_outcome" in sql
     assert "proxy_return_30m_pct" in sql
@@ -132,6 +147,7 @@ def test_relaxed_watch_emit_sql_marks_rows_as_watch_not_intermediate():
     assert "risk_note" in sql
     assert "failed_gate" in sql
     assert "counterfactual" in sql
+    assert "'max_debit', ceil((rw.lead_quote_mid * 1.01) * 100.0) / 100.0" in sql
     assert "not_constructed_db_replay_watch_only" in sql
     assert "ON CONFLICT (symbol, session_date, strategy_key, entry_time, decision) DO NOTHING" in sql
 
