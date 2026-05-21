@@ -47,7 +47,9 @@ jobs:
       RESOURCE_GROUP: rg-sigmatiq-prod
       CONTAINER_APPS_ENV: cae-sigmatiq-prod
       ACR_LOGIN_SERVER: acrsigmatiqprodiotgrj.azurecr.io
+      KEY_VAULT_NAME: kvsigmatiqprodiotgrj
       APP_NAME: sigmatiq-nexus-ca
+      DB_SIGNAL_APP_NAME: sigmatiq-nexus-db-signal-ca
 
     steps:
       - uses: actions/checkout@v5
@@ -80,7 +82,9 @@ jobs:
           set -euo pipefail
 
           REDIS_CONN_STRING="${{ secrets.NEXUS_REDIS_URL }}"
+          SHARED_DB_URL="$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name shared-database-url --query value -o tsv)"
           test -n "$REDIS_CONN_STRING"
+          test -n "$SHARED_DB_URL"
 
           ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
           ACR_USER="$(az acr credential show --name "$ACR_NAME" --query username -o tsv)"
@@ -128,5 +132,50 @@ jobs:
                 "NEXUS_SYMBOLS=SPY,QQQ,IWM,UVXY" \
                 "NEXUS_FIRST_TRIGGER_SCOPE=symbol" \
                 "NEXUS_GROUP_LOCK_STRATEGIES=etf_confluence_sniper" \
+                "IMAGE_TAG=${IMAGE_TAG}"
+          fi
+
+          if ! az containerapp show --name "$DB_SIGNAL_APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+            az containerapp create \
+              --name "$DB_SIGNAL_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINER_APPS_ENV" \
+              --image "$IMAGE_NAME" \
+              --min-replicas 1 \
+              --max-replicas 1 \
+              --registry-server "$ACR_LOGIN_SERVER" \
+              --registry-username "$ACR_USER" \
+              --registry-password "$ACR_PASS" \
+              --command "nexus-db-signal-worker" \
+              --secrets "shared-db-url=${SHARED_DB_URL}" \
+              --env-vars \
+                "SHARED_DATABASE_URL=secretref:shared-db-url" \
+                "NEXUS_DB_SIGNAL_SYMBOLS=SPY,QQQ,IWM,UVXY" \
+                "NEXUS_DB_SIGNAL_POLL_SECONDS=30" \
+                "NEXUS_DB_REPLAY_INCLUDE_RELAXED_WATCH=true" \
+                "IMAGE_TAG=${IMAGE_TAG}"
+          else
+            az containerapp secret set \
+              --name "$DB_SIGNAL_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --secrets "shared-db-url=${SHARED_DB_URL}"
+
+            az containerapp registry set \
+              --name "$DB_SIGNAL_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --server "$ACR_LOGIN_SERVER" \
+              --username "$ACR_USER" \
+              --password "$ACR_PASS"
+
+            az containerapp update \
+              --name "$DB_SIGNAL_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --image "$IMAGE_NAME" \
+              --command "nexus-db-signal-worker" \
+              --set-env-vars \
+                "SHARED_DATABASE_URL=secretref:shared-db-url" \
+                "NEXUS_DB_SIGNAL_SYMBOLS=SPY,QQQ,IWM,UVXY" \
+                "NEXUS_DB_SIGNAL_POLL_SECONDS=30" \
+                "NEXUS_DB_REPLAY_INCLUDE_RELAXED_WATCH=true" \
                 "IMAGE_TAG=${IMAGE_TAG}"
           fi

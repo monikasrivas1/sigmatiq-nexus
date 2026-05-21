@@ -179,6 +179,8 @@ nexus-db-signal-worker \
 
 By default the worker emits normal DB replay `INTERMEDIATE` rows and relaxed `WATCH` rows for the current New York session date. Set `NEXUS_DB_SIGNAL_SESSION_DATE=YYYY-MM-DD` or pass `--session-date` only for controlled replay/backfill. The worker logs JSON events to stdout and relies on `live.nexus_db_signal_emission` plus existing `live.nexus_strategy_signal` rows for idempotence, so repeated polls do not duplicate signals. It reads only Postgres materialized/raw-live tables and does not write Redis overlays.
 
+Production runs the polling worker as a separate Azure Container App, `sigmatiq-nexus-db-signal-ca`, from the same `sigmatiq-nexus` image. The normal `sigmatiq-nexus-ca` app still runs the Redis live Nexus worker. The DB signal app overrides the container command to `python -m sigmatiq_nexus.db_signal_worker`, uses `SHARED_DATABASE_URL=secretref:shared-db-url`, and polls `SPY,QQQ,IWM,UVXY` every 30 seconds with relaxed watch rows enabled.
+
 At runtime Nexus enriches raw option trade events from:
 
 - `equity:live:context:{symbol}` for `underlying_mid` and spot freshness.
