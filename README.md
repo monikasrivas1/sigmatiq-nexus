@@ -142,17 +142,32 @@ The DB replay emitter is an additive recovery/audit path for days where Redis li
 nexus-db-signal-emitter \
   --session-date 2026-05-20 \
   --symbols SPY,QQQ,IWM,UVXY \
-  --strategies etf_open_specialist,etf_low_sweep_core,etf_flow_specialist \
+  --strategies etf_confluence_sniper,etf_open_specialist,etf_low_sweep_core,etf_flow_specialist,etf_momentum_specialist,etf_put_credit_open30_spread,etf_call_credit_open30_spread \
   --dry-run
 ```
 
-For v1 this runner emits only DB-proven `INTERMEDIATE` candidates:
+For v1 this runner emits only DB-proven `INTERMEDIATE` candidates for the seven primary Nexus strategy lanes:
 
+- `etf_confluence_sniper`: 10:00-12:00 ET pricing/momentum proxy only when DB materialization proves reliable pricing, lead-contract Greeks, quote-as-of-window data, and directional equity/flow alignment.
 - `etf_open_specialist`: 10:00 ET open30 bullish call dominance with ready materialized context, healthy EOD context, fresh quote-as-of-window data, required premium, and a call-side lead contract.
 - `etf_low_sweep_core`: 10:00/10:30 ET low-sweep side dominance only when DB materialization proves `sweep_quality_status="ready"` and `sweep_ratio <= NEXUS_DB_REPLAY_MAX_SWEEP_RATIO` / `--max-sweep-ratio`.
 - `etf_flow_specialist`: 10:00/10:30/11:00 ET directional flow alignment only when DB materialization proves sweep/aggressor quality, healthy IV/GEX context, fresh quote-as-of-window data, and lead-contract Greeks. DB replay writes the heuristic `INTERMEDIATE` candidate and marks model scoring as `not_run_db_replay_intermediate_only`; final model/BET promotion remains a separate step.
+- `etf_momentum_specialist`: 11:00 ET price-persistence proxy only when DB materialization proves IV rank, lead-contract Greeks, quote-as-of-window data, and directional equity/flow alignment. DB replay marks model scoring as `not_run_db_replay_intermediate_only`.
+- `etf_put_credit_open30_spread`: 10:00 ET SPY/QQQ open30 call-dominance context with IV-rank gating. DB replay records `spread_status="not_constructed_db_replay_intermediate_only"` because exact multileg construction remains live-worker owned.
+- `etf_call_credit_open30_spread`: 10:00 ET SPY open30 put-dominance context with IV-rank gating. DB replay records `spread_status="not_constructed_db_replay_intermediate_only"` because exact multileg construction remains live-worker owned.
 
 The CLI is EOD/audit-first, but the evaluator is poll-safe: repeated runs are gated by `live.nexus_db_signal_emission` and existing `live.nexus_strategy_signal` rows. It can therefore be reused by a future realtime worker loop without changing strategy eligibility. It does not publish Redis overlays, execution events, or final `BET` rows; live `BET` remains owned by the Redis Nexus worker.
+
+The same runner can optionally publish relaxed-gate review rows:
+
+```bash
+nexus-db-signal-emitter \
+  --session-date 2026-05-20 \
+  --symbols SPY,QQQ,IWM,UVXY \
+  --relaxed-watch-only
+```
+
+Relaxed rows use `decision="WATCH"` and `source="sigmatiq_nexus_db_replay_relaxed"`. They are not normal `INTERMEDIATE` candidates. The payload records the failed production gate, actual value, required value, relaxed value, risk note, and a DB counterfactual from `live.raw_option_tcbbo_1s`. Current relaxed-watch coverage is limited to one-gate near misses for flow sweep ratio, momentum IV rank, and open30 spread IV rank. Spread watch rows still mark exact spread construction as not run.
 
 At runtime Nexus enriches raw option trade events from:
 
