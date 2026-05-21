@@ -82,14 +82,21 @@ def _realtime_lag_where_prefix(config: EmitterConfig, alias: str) -> str:
     if config.max_realtime_lag_seconds is None:
         return ""
     seconds = max(0, int(config.max_realtime_lag_seconds))
-    return f"      now() <= {alias}.window_end_utc + interval '{seconds} seconds'\n      AND "
+    return (
+        f"      now() <= {alias}.window_end_utc + interval '{seconds} seconds'\n"
+        f"      AND {alias}.materialized_at_utc <= {alias}.window_end_utc + interval '{seconds} seconds'\n"
+        "      AND "
+    )
 
 
 def _realtime_lag_and_clause(config: EmitterConfig, alias: str) -> str:
     if config.max_realtime_lag_seconds is None:
         return ""
     seconds = max(0, int(config.max_realtime_lag_seconds))
-    return f"      AND now() <= {alias}.window_end_utc + interval '{seconds} seconds'\n"
+    return (
+        f"      AND now() <= {alias}.window_end_utc + interval '{seconds} seconds'\n"
+        f"      AND {alias}.materialized_at_utc <= {alias}.window_end_utc + interval '{seconds} seconds'\n"
+    )
 
 
 def _base_ctes(config: EmitterConfig) -> str:
@@ -694,6 +701,8 @@ payloads AS (
             ),
             'db_replay', jsonb_build_object(
                 'materialized_at_utc', e.materialized_at_utc,
+                'materialization_lag_seconds', EXTRACT(EPOCH FROM (e.materialized_at_utc - e.window_end_utc)),
+                'max_realtime_lag_seconds', {config.max_realtime_lag_seconds if config.max_realtime_lag_seconds is not None else "null"},
                 'window_label', e.window_label,
                 'replay_reason', e.replay_reason,
                 'total_premium', e.total_premium,
@@ -1189,6 +1198,8 @@ payloads AS (
             ),
             'db_replay', jsonb_build_object(
                 'materialized_at_utc', rw.materialized_at_utc,
+                'materialization_lag_seconds', EXTRACT(EPOCH FROM (rw.materialized_at_utc - rw.window_end_utc)),
+                'max_realtime_lag_seconds', {config.max_realtime_lag_seconds if config.max_realtime_lag_seconds is not None else "null"},
                 'window_label', rw.window_label,
                 'replay_reason', rw.replay_reason,
                 'replay_scope', 'relaxed_gate_watch_only',

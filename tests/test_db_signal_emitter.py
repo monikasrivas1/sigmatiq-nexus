@@ -94,10 +94,15 @@ def test_realtime_lag_filter_blocks_stale_live_worker_candidates():
     sql = build_emit_sql(_config(max_realtime_lag_seconds=300))
 
     assert "now() <= sc.window_end_utc + interval '300 seconds'" in sql
+    assert "sc.materialized_at_utc <= sc.window_end_utc + interval '300 seconds'" in sql
+    assert "'materialization_lag_seconds', EXTRACT(EPOCH FROM (e.materialized_at_utc - e.window_end_utc))" in sql
+    assert "'max_realtime_lag_seconds', 300" in sql
 
     watch_sql = build_relaxed_watch_emit_sql(_config(max_realtime_lag_seconds=300))
 
     assert "now() <= rw.window_end_utc + interval '300 seconds'" in watch_sql
+    assert "rw.materialized_at_utc <= rw.window_end_utc + interval '300 seconds'" in watch_sql
+    assert "'materialization_lag_seconds', EXTRACT(EPOCH FROM (rw.materialized_at_utc - rw.window_end_utc))" in watch_sql
 
 
 def test_relaxed_watch_sql_is_separate_watch_only_path():
