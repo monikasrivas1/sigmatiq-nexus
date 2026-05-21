@@ -169,6 +169,16 @@ nexus-db-signal-emitter \
 
 Relaxed rows use `decision="WATCH"` and `source="sigmatiq_nexus_db_replay_relaxed"`. They are not normal `INTERMEDIATE` candidates. The payload records the failed production gate, actual value, required value, relaxed value, risk note, and a DB counterfactual from `live.raw_option_tcbbo_1s`. Current relaxed-watch coverage is limited to one-gate near misses for flow sweep ratio, momentum IV rank, and open30 spread IV rank. Spread watch rows still mark exact spread construction as not run.
 
+The realtime DB signal worker wraps the same idempotent emitter in a polling loop:
+
+```bash
+nexus-db-signal-worker \
+  --symbols SPY,QQQ,IWM,UVXY \
+  --poll-seconds 30
+```
+
+By default the worker emits normal DB replay `INTERMEDIATE` rows and relaxed `WATCH` rows for the current New York session date. Set `NEXUS_DB_SIGNAL_SESSION_DATE=YYYY-MM-DD` or pass `--session-date` only for controlled replay/backfill. The worker logs JSON events to stdout and relies on `live.nexus_db_signal_emission` plus existing `live.nexus_strategy_signal` rows for idempotence, so repeated polls do not duplicate signals. It reads only Postgres materialized/raw-live tables and does not write Redis overlays.
+
 At runtime Nexus enriches raw option trade events from:
 
 - `equity:live:context:{symbol}` for `underlying_mid` and spot freshness.
