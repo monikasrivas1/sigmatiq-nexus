@@ -152,6 +152,7 @@ jobs:
                 "SHARED_DATABASE_URL=secretref:shared-db-url" \
                 "NEXUS_DB_SIGNAL_SYMBOLS=SPY,QQQ,IWM,UVXY" \
                 "NEXUS_DB_SIGNAL_POLL_SECONDS=30" \
+                "NEXUS_DB_SIGNAL_MAX_WINDOW_LAG_SECONDS=300" \
                 "NEXUS_DB_REPLAY_INCLUDE_RELAXED_WATCH=true" \
                 "IMAGE_TAG=${IMAGE_TAG}"
           else
@@ -176,6 +177,7 @@ jobs:
                 "SHARED_DATABASE_URL=secretref:shared-db-url" \
                 "NEXUS_DB_SIGNAL_SYMBOLS=SPY,QQQ,IWM,UVXY" \
                 "NEXUS_DB_SIGNAL_POLL_SECONDS=30" \
+                "NEXUS_DB_SIGNAL_MAX_WINDOW_LAG_SECONDS=300" \
                 "NEXUS_DB_REPLAY_INCLUDE_RELAXED_WATCH=true" \
                 "IMAGE_TAG=${IMAGE_TAG}"
           fi

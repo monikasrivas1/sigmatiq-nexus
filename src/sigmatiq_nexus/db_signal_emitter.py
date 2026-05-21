@@ -52,6 +52,7 @@ class EmitterConfig:
     relaxed_spread_max_iv_rank: float
     dry_run: bool
     limit: int | None
+    max_realtime_lag_seconds: int | None
 
 
 def confidence_for_open_call_dominance(call_premium: float, total_premium: float) -> float:
@@ -75,6 +76,20 @@ def _json_literal(value: Any) -> str:
 
 def _strategy_filter(config: EmitterConfig) -> str:
     return "SELECT value::text AS strategy_key FROM jsonb_array_elements_text(" + _json_literal(list(config.strategies)) + "::jsonb)"
+
+
+def _realtime_lag_where_prefix(config: EmitterConfig, alias: str) -> str:
+    if config.max_realtime_lag_seconds is None:
+        return ""
+    seconds = max(0, int(config.max_realtime_lag_seconds))
+    return f"      now() <= {alias}.window_end_utc + interval '{seconds} seconds'\n      AND "
+
+
+def _realtime_lag_and_clause(config: EmitterConfig, alias: str) -> str:
+    if config.max_realtime_lag_seconds is None:
+        return ""
+    seconds = max(0, int(config.max_realtime_lag_seconds))
+    return f"      AND now() <= {alias}.window_end_utc + interval '{seconds} seconds'\n"
 
 
 def _base_ctes(config: EmitterConfig) -> str:
@@ -617,7 +632,8 @@ eligible AS (
     SELECT sc.*
     FROM strategy_candidates sc
     JOIN requested_strategies rs ON rs.strategy_key = sc.strategy_key
-    WHERE NOT EXISTS (
+    WHERE
+{_realtime_lag_where_prefix(config, "sc")}      NOT EXISTS (
         SELECT 1
         FROM live.nexus_strategy_signal existing
         WHERE existing.symbol = sc.symbol
@@ -1108,7 +1124,7 @@ relaxed_watch_eligible AS (
     FROM relaxed_watch_with_outcome rw
     JOIN requested_strategies rs ON rs.strategy_key = rw.strategy_key
     WHERE rw.first_mid_after_entry IS NOT NULL
-      AND NOT EXISTS (
+{_realtime_lag_and_clause(config, "rw")}      AND NOT EXISTS (
           SELECT 1
           FROM live.nexus_strategy_signal existing
           WHERE existing.symbol = rw.symbol
@@ -1308,6 +1324,7 @@ def parse_args(argv: list[str]) -> EmitterConfig:
     parser.add_argument("--relaxed-spread-max-iv-rank", type=float, default=float(os.environ.get("NEXUS_DB_REPLAY_RELAXED_SPREAD_MAX_IV_RANK", DEFAULT_RELAXED_SPREAD_MAX_IV_RANK)))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--max-realtime-lag-seconds", type=int, default=None)
     args = parser.parse_args(argv)
     if not args.database_url:
         parser.error("--database-url or SHARED_DATABASE_URL/DATABASE_URL is required")
@@ -1338,6 +1355,7 @@ def parse_args(argv: list[str]) -> EmitterConfig:
         relaxed_spread_max_iv_rank=args.relaxed_spread_max_iv_rank,
         dry_run=args.dry_run,
         limit=args.limit,
+        max_realtime_lag_seconds=args.max_realtime_lag_seconds,
     )
 
 

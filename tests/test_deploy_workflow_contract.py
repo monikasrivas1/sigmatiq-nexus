@@ -16,4 +16,5 @@ def test_prod_deploy_starts_db_signal_worker_container_app():
     assert '"SHARED_DATABASE_URL=secretref:shared-db-url"' in workflow
     assert '"NEXUS_DB_SIGNAL_SYMBOLS=SPY,QQQ,IWM,UVXY"' in workflow
     assert '"NEXUS_DB_SIGNAL_POLL_SECONDS=30"' in workflow
+    assert '"NEXUS_DB_SIGNAL_MAX_WINDOW_LAG_SECONDS=300"' in workflow
     assert '"NEXUS_DB_REPLAY_INCLUDE_RELAXED_WATCH=true"' in workflow

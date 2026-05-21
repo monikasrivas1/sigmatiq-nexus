@@ -31,6 +31,7 @@ def _config(**overrides) -> EmitterConfig:
         "relaxed_spread_max_iv_rank": 45.0,
         "dry_run": False,
         "limit": None,
+        "max_realtime_lag_seconds": None,
     }
     config.update(overrides)
     return EmitterConfig(**config)
@@ -89,6 +90,16 @@ def test_emit_sql_uses_idempotent_ledger_before_append_only_signal_insert():
     assert json.dumps({"IWM": 75_000.0}) in sql
 
 
+def test_realtime_lag_filter_blocks_stale_live_worker_candidates():
+    sql = build_emit_sql(_config(max_realtime_lag_seconds=300))
+
+    assert "now() <= sc.window_end_utc + interval '300 seconds'" in sql
+
+    watch_sql = build_relaxed_watch_emit_sql(_config(max_realtime_lag_seconds=300))
+
+    assert "now() <= rw.window_end_utc + interval '300 seconds'" in watch_sql
+
+
 def test_relaxed_watch_sql_is_separate_watch_only_path():
     sql = build_relaxed_watch_candidate_sql(_config(limit=5))
 
@@ -145,6 +156,7 @@ def test_parse_args_normalizes_symbols_and_requires_iso_date():
     assert config.spread_max_iv_rank == 28
     assert config.include_relaxed_watch is True
     assert config.relaxed_flow_sweep_ratio == 0.0002
+    assert config.max_realtime_lag_seconds is None
     assert "host=db" in config.database_url
 
 

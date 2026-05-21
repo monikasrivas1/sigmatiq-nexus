@@ -24,6 +24,7 @@ def test_parse_args_defaults_to_relaxed_watch_included_for_worker():
     assert config.emitter.symbols == ("SPY", "QQQ")
     assert config.emitter.include_relaxed_watch is True
     assert config.emitter.relaxed_watch_only is False
+    assert config.emitter.max_realtime_lag_seconds == 300
     assert "host=db" in config.emitter.database_url
 
 
@@ -51,3 +52,4 @@ def test_run_once_rebuilds_emitter_for_current_session():
     assert seen[0].session_date == "2026-05-20"
     assert seen[0].dry_run is True
     assert seen[0].include_relaxed_watch is True
+    assert seen[0].max_realtime_lag_seconds == 300

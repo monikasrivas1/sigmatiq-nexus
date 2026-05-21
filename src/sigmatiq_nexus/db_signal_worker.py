@@ -68,6 +68,7 @@ def run_once(config: WorkerConfig, runner: Callable[[EmitterConfig], list[dict[s
         relaxed_spread_max_iv_rank=config.emitter.relaxed_spread_max_iv_rank,
         dry_run=config.emitter.dry_run,
         limit=config.emitter.limit,
+        max_realtime_lag_seconds=config.emitter.max_realtime_lag_seconds,
     )
     started = time.monotonic()
     rows = runner(emitter)
@@ -126,6 +127,7 @@ def parse_args(argv: list[str]) -> WorkerConfig:
     parser.add_argument("--relaxed-spread-max-iv-rank", type=float, default=float(os.environ.get("NEXUS_DB_REPLAY_RELAXED_SPREAD_MAX_IV_RANK", DEFAULT_RELAXED_SPREAD_MAX_IV_RANK)))
     parser.add_argument("--dry-run", action="store_true", default=os.environ.get("NEXUS_DB_SIGNAL_DRY_RUN", "").lower() in {"1", "true", "yes"})
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--max-realtime-lag-seconds", type=int, default=int(os.environ.get("NEXUS_DB_SIGNAL_MAX_WINDOW_LAG_SECONDS", "300")))
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
 
@@ -140,6 +142,8 @@ def parse_args(argv: list[str]) -> WorkerConfig:
         session_date_override = None
     if args.poll_seconds < 5:
         parser.error("--poll-seconds must be at least 5")
+    if args.max_realtime_lag_seconds < 0:
+        parser.error("--max-realtime-lag-seconds must be zero or greater")
 
     symbols = tuple(sym.strip().upper() for sym in args.symbols.split(",") if sym.strip())
     strategies = tuple(strategy.strip() for strategy in args.strategies.split(",") if strategy.strip())
@@ -165,6 +169,7 @@ def parse_args(argv: list[str]) -> WorkerConfig:
         relaxed_spread_max_iv_rank=args.relaxed_spread_max_iv_rank,
         dry_run=args.dry_run,
         limit=args.limit,
+        max_realtime_lag_seconds=args.max_realtime_lag_seconds,
     )
     return WorkerConfig(
         emitter=emitter,
